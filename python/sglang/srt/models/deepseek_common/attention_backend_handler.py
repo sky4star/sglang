@@ -1,6 +1,6 @@
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.tbo_backend import TboAttnBackend
-from sglang.srt.layers.cp.utils import enable_cp_v2, is_cp_v2_active
+from sglang.srt.layers.cp.utils import is_cp_active, supports_generic_prefill_cp
 from sglang.srt.layers.utils.cp_utils import mla_use_prefill_cp
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
@@ -115,8 +115,8 @@ def _handle_attention_backend(attn, forward_batch, backend_name):
     # Strategy CP gathers latent KV in the backend's absorbed MLA path;
     # normal MHA would write rank-local KV against full cache locations.
     # Protected platform CP retains its model-side materialization path.
-    if is_cp_v2_active(forward_batch) or (
-        not enable_cp_v2() and mla_use_prefill_cp(forward_batch)
+    if is_cp_active(forward_batch) or (
+        not supports_generic_prefill_cp() and mla_use_prefill_cp(forward_batch)
     ):
         return _dispatch_mla_subtype(attn, forward_batch)
 

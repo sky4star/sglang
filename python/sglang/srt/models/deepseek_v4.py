@@ -62,8 +62,8 @@ from sglang.srt.layers.communicator_dsa_cp import (
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
     cp_materialize_global_token_order,
-    enable_cp_v2,
     is_cp_v2_active,
+    supports_generic_prefill_cp,
 )
 from sglang.srt.layers.dp_attention import (
     _tbo_event,
@@ -3260,7 +3260,9 @@ class DeepseekV4Model(nn.Module):
         # execution cannot expose per-layer completed hidden states), so skip
         # TBO when capturing -- a perf-only downgrade, not a correctness one.
         run_tbo = self._can_run_tbo(forward_batch) and not capture_dspark
-        use_platform_cp = not enable_cp_v2() and dsa_use_prefill_cp(forward_batch)
+        use_platform_cp = not supports_generic_prefill_cp() and dsa_use_prefill_cp(
+            forward_batch
+        )
         if use_platform_cp and not run_tbo:
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
@@ -3478,7 +3480,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
-        if not enable_cp_v2() and self.dsa_enable_prefill_cp:
+        if not supports_generic_prefill_cp() and self.dsa_enable_prefill_cp:
             if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),

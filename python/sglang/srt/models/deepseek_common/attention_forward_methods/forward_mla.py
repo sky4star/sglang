@@ -17,7 +17,7 @@ from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.dsa.utils import is_graph_dsa_split_op_surface
 from sglang.srt.layers.attention.dsa_backend import prepare_kv_for_attention
 from sglang.srt.layers.communicator import get_attn_tp_context
-from sglang.srt.layers.cp.utils import enable_cp_v2
+from sglang.srt.layers.cp.utils import supports_generic_prefill_cp
 from sglang.srt.layers.dcp import (
     all_gather_kv_cache_for_mla_extend,
     all_gather_q_for_mla_decode,
@@ -626,7 +626,7 @@ class DeepseekMLAForwardMixin:
             defer_materialization=fuse_rope_for_trtllm_mla,
         )
 
-        if not enable_cp_v2() and mla_use_prefill_cp(forward_batch):
+        if not supports_generic_prefill_cp() and mla_use_prefill_cp(forward_batch):
             k_nope, k_pe = self.rebuild_cp_kv_cache(
                 latent_cache, forward_batch, k_nope, k_pe
             )

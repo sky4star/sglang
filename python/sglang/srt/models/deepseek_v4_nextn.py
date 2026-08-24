@@ -14,7 +14,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_prefill_cp_round_robin_split,
 )
 from sglang.srt.layers.cp.utils import (
-    enable_cp_v2,
+    supports_generic_prefill_cp,
 )
 from sglang.srt.layers.dp_attention import (
     dp_gather_replicate,
@@ -143,7 +143,9 @@ class DeepseekV4ModelNextN(nn.Module):
         forward_batch: ForwardBatch,
         input_embeds: torch.Tensor = None,
     ) -> torch.Tensor:
-        use_platform_cp = not enable_cp_v2() and dsa_use_prefill_cp(forward_batch)
+        use_platform_cp = not supports_generic_prefill_cp() and dsa_use_prefill_cp(
+            forward_batch
+        )
         if input_embeds is None:
             hidden_states = self.embed_tokens(input_ids)
         else:
@@ -255,7 +257,7 @@ class DeepseekV4ForCausalLMNextN(DeepseekV4ForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if self.dsa_enable_prefill_cp and not enable_cp_v2():
+        if self.dsa_enable_prefill_cp and not supports_generic_prefill_cp():
             if can_dsa_cp_split(len(input_ids), self.cp_size, True, forward_batch):
                 forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),

@@ -85,7 +85,7 @@ from sglang.srt.layers.communicator_dsa_cp import (
     maybe_prefetch_next_full_attention_kv,
 )
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
-from sglang.srt.layers.cp.utils import enable_cp_v2
+from sglang.srt.layers.cp.utils import supports_generic_prefill_cp
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
@@ -532,7 +532,7 @@ class MoEGate(nn.Module):
             return F.linear(hidden_states, self.weight, None)
 
         if (
-            not enable_cp_v2()
+            not supports_generic_prefill_cp()
             and not self.is_deepseek_v4
             and forward_batch is not None
             and (dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch))
@@ -2804,7 +2804,7 @@ class DeepseekV2Model(nn.Module):
         )
 
         # HIP/NPU/MUSA retain their model-side CP boundary.
-        use_platform_cp = not enable_cp_v2() and (
+        use_platform_cp = not supports_generic_prefill_cp() and (
             dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch)
         )
         if use_platform_cp:
@@ -3088,7 +3088,7 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             len_input_ids = input_embeds.shape[0]
         else:
             len_input_ids = pp_proxy_tensors["hidden_states"].shape[0]
-        if not enable_cp_v2():
+        if not supports_generic_prefill_cp():
             if is_dsa_enable_prefill_cp():
                 if can_dsa_cp_split(
                     len_input_ids,

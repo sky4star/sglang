@@ -35,7 +35,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     is_dsa_prefill_cp_round_robin_split,
 )
 from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
-from sglang.srt.layers.cp.utils import enable_cp_v2
+from sglang.srt.layers.cp.utils import supports_generic_prefill_cp
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
@@ -261,7 +261,7 @@ class DeepseekModelNextN(nn.Module):
                     hidden_states = self.eh_proj(eh_input)
 
             # Protected platforms retain their model-side token split.
-            use_platform_cp = not enable_cp_v2() and (
+            use_platform_cp = not supports_generic_prefill_cp() and (
                 dsa_use_prefill_cp(forward_batch) or mla_use_prefill_cp(forward_batch)
             )
             if use_platform_cp:
@@ -371,7 +371,7 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        if not enable_cp_v2():
+        if not supports_generic_prefill_cp():
             if is_dsa_enable_prefill_cp():
                 if can_dsa_cp_split(
                     len(input_ids),
