@@ -13,6 +13,7 @@
 # ==============================================================================
 
 import logging
+import re
 
 from sglang.srt.models.deepseek_nextn import DeepseekV3ForCausalLMNextN
 from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
@@ -52,6 +53,12 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
             return None
         return super()._resolve_nextn_quant_config(config, quant_config)
 
+    def _get_nextn_embedding_tp_kwargs(self) -> dict:
+        # GLM's shared target embedding is sharded over the model TP group; the
+        # DeepSeek draft default may instead pick the attention-TP group (size 1
+        # under DP attention) and index a full-vocab table, causing an OOB gather.
+        return {"enable_tp": True, "use_attn_tp_group": False}
+
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(
             getattr(config, "text_config", config),
@@ -63,18 +70,20 @@ class Glm5NextForConditionalGenerationNextN(DeepseekV3ForCausalLMNextN):
         if not hasattr(self, "fuse_qkv_a_proj"):
             self.fuse_qkv_a_proj = getattr(self.config, "q_lora_rank", None) is not None
         layer_id = self.config.num_hidden_layers
-        layer_prefixes = (
-            f"model.layers.{layer_id}.",
-            f"model.language_model.layers.{layer_id}.",
-        )
-        nextn_weights = (
-            (name, weight)
-            for name, weight in weights
-            if name.startswith(layer_prefixes)
-        )
         return Glm5NextForConditionalGeneration.load_weights(
-            self, nextn_weights, is_nextn=True
+            self,
+            self._select_nextn_weights(weights=weights, layer_id=layer_id),
+            is_nextn=True,
         )
+
+    @staticmethod
+    def _select_nextn_weights(weights, layer_id: int):
+        canonical_prefix = f"model.layers.{layer_id}."
+        for name, weight in weights:
+            match = re.search(r"layers\.(\d+)\.", name)
+            if match is None or int(match.group(1)) != layer_id:
+                continue
+            yield canonical_prefix + name[match.end() :], weight
 
 
 EntryClass = [Glm5NextForConditionalGenerationNextN]
