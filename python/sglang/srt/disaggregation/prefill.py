@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 from array import array
 from collections import deque
 from http import HTTPStatus
@@ -105,6 +106,40 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _is_npu = is_npu()
+
+# Lazily-loaded draft-context projector (fc + hidden_norm) from the drafter
+# checkpoint, used by the P-side draft-hidden channel (Design-B PD).
+_DHC_PROJECTOR_CACHE: dict = {}
+
+
+def _dhc_get_projector(device):
+    path = os.environ.get("SGL_DHC_DRAFTER", "")
+    if not path:
+        return None
+    key = str(device)
+    cached = _DHC_PROJECTOR_CACHE.get(key)
+    if cached is not None:
+        return cached
+    try:
+        from safetensors import safe_open
+
+        fpath = os.path.join(path, "model.safetensors")
+        with safe_open(fpath, framework="pt", device="cpu") as f:
+            fc = f.get_tensor("fc.weight").to(device=device, dtype=torch.float32)
+            hn = f.get_tensor("hidden_norm.weight").to(
+                device=device, dtype=torch.float32
+            )
+        _DHC_PROJECTOR_CACHE[key] = (fc, hn)
+        logger.info(
+            "[DHC-P] loaded draft-context projector fc%s norm%s from %s",
+            tuple(fc.shape),
+            tuple(hn.shape),
+            fpath,
+        )
+        return fc, hn
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[DHC-P] projector load failed from %s: %s", path, e)
+        return None
 
 
 def should_force_retry(req: Req) -> bool:
@@ -389,6 +424,9 @@ class PrefillBootstrapQueue:
             return False
         req.metadata_buffer_index = self.req_to_metadata_buffer_idx_allocator.alloc()
         assert req.metadata_buffer_index is not None
+        # Recycled metadata slot: drop any stale draft-context hidden so the
+        # next owner cannot inherit it.
+        self.metadata_buffers.clear_draft_ctx(req.metadata_buffer_index)
         return True
 
     def finalize_bootstrap(self, req: Req) -> bool:
@@ -830,6 +868,67 @@ class SchedulerDisaggregationPrefillMixin:
             if extend_logprob_start_len < extend_input_len:
                 logprob_pt += extend_input_len - extend_logprob_start_len
 
+        # ==== Draft-context hidden (Design-B PD) ====
+        # If P captured the 6-tap aux hidden (SGL_DHC_P), project it with the
+        # drafter's fc + hidden_norm, keep the per-request tail window across
+        # prefill chunks, and attach it to the request on its final chunk so
+        # set_buf ships it to D over the aux channel.
+        if (
+            envs.SGLANG_DRAFT_HIDDEN_CHANNEL.get()
+            and not envs.SGLANG_DRAFT_HIDDEN_DEBUG.get()
+        ):
+            _hs = getattr(logits_output, "hidden_states", None)
+            if _hs is not None:
+                _proj = _dhc_get_projector(_hs.device)
+                if _proj is None:
+                    # D expects fc-projected [n, dim]; never ship raw taps.
+                    if not getattr(self, "_dhc_proj_warned", False):
+                        logger.warning(
+                            "[DHC-P] projector unavailable (check SGL_DHC_DRAFTER); "
+                            "skipping draft-context hidden"
+                        )
+                        self._dhc_proj_warned = True
+                else:
+                    _fc, _hn = _proj
+                    _W = int(envs.SGLANG_DRAFT_HIDDEN_WINDOW.get())
+                    _extend = list(batch.extend_lens or [])
+                    _off = 0
+                    for _i, _req in enumerate(batch.reqs):
+                        _e = int(_extend[_i]) if _i < len(_extend) else 0
+                        _seg = _hs[_off : _off + _e]
+                        _off += _e
+                        if _seg.numel() == 0:
+                            continue
+                        if str(_req.rid).startswith("HEALTH_CHECK"):
+                            continue
+                        if is_aborted(_req):
+                            # Accumulator lives on the request; aborting just
+                            # drops it so a recycled slot can't leak.
+                            _req._dhc_acc = None
+                            continue
+                        with torch.inference_mode():
+                            _x = _seg.to(torch.float32)
+                            _p = torch.nn.functional.linear(_x, _fc)
+                            _p = (
+                                _p
+                                * torch.rsqrt(_p.pow(2).mean(-1, keepdim=True) + 1e-5)
+                                * _hn
+                            )
+                            _seg = _p.to(torch.bfloat16)
+                        _buf = getattr(_req, "_dhc_acc", None)
+                        _buf = (
+                            _seg.contiguous()
+                            if _buf is None
+                            else torch.cat([_buf, _seg], dim=0)
+                        )
+                        _buf = _buf[-_W:].contiguous()
+                        if _req.inflight_middle_chunks <= 0:
+                            _req.draft_ctx_hidden = _buf
+                            _req._dhc_acc = None
+                        else:
+                            _req._dhc_acc = _buf
+        # ==== end draft-context hidden ====
+
         for i, (req, next_token_id) in enumerate(
             zip(batch.reqs, next_token_ids, strict=True)
         ):
@@ -904,6 +1003,25 @@ class SchedulerDisaggregationPrefillMixin:
                 else:
                     req.hidden_states_tensor = None
                     req.output_dsa_topk_indices = None
+                if (
+                    envs.SGLANG_DRAFT_HIDDEN_CHANNEL.get()
+                    and envs.SGLANG_DRAFT_HIDDEN_DEBUG.get()
+                    and not str(req.rid).startswith("HEALTH_CHECK")
+                ):
+                    # Test-only deterministic payload to verify the P->D aux
+                    # channel before wiring the real capture/window/fc path.
+                    _w = int(envs.SGLANG_DRAFT_HIDDEN_WINDOW.get())
+                    _d = int(envs.SGLANG_DRAFT_HIDDEN_DIM.get())
+                    _seed = (abs(hash(req.rid)) % 89) + 1
+                    req.draft_ctx_hidden = (
+                        torch.arange(_w * _d, dtype=torch.float32).reshape(_w, _d)
+                        * (_seed * 1e-3)
+                    ).to(torch.bfloat16)
+                    print(
+                        f"[DHC-P] rid={req.rid} debug payload shape={(_w, _d)} "
+                        f"seed={_seed} sum={float(req.draft_ctx_hidden.float().sum()):.3f}",
+                        flush=True,
+                    )
                 if req.return_logprob:
                     assert extend_logprob_start_len_per_req is not None
                     assert extend_input_len_per_req is not None

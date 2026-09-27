@@ -146,6 +146,8 @@ logger = logging.getLogger(__name__)
 # PP+spec gate admits (GLM/DeepSeek NextN, Bailing MTP, Mistral-style drafts).
 _EMBED_TENSOR_NAMES = (
     "model.embed_tokens.weight",
+    "model.language_model.embed_tokens.weight",
+    "language_model.embed_tokens.weight",
     "embed.weight",
     "model.word_embeddings.weight",
     "tok_embeddings.weight",

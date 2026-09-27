@@ -537,6 +537,19 @@ class Envs:
     SGLANG_DSPARK_ENABLE_SPS_RECORD = EnvBool(False)
     SGLANG_DSPARK_FAST_KERNEL = EnvBool(True)
     SGLANG_DSPARK_FP32_LM_HEAD = EnvBool(False)
+
+    # Draft-context hidden channel (PD, P=PP + D=spec): P ships the tail-window
+    # fc-projected aux hidden to D over the existing PD aux channel (metadata
+    # buffers, transferred by Mooncake together with the KV), so D can build the
+    # draft KV without running the draft on P. Default off; when off, nothing is
+    # allocated and behavior is unchanged. Must be set identically on P and D.
+    SGLANG_DRAFT_HIDDEN_CHANNEL = EnvBool(False)
+    SGLANG_DRAFT_HIDDEN_WINDOW = EnvInt(2048)
+    SGLANG_DRAFT_HIDDEN_DIM = EnvInt(4096)
+    SGLANG_DRAFT_HIDDEN_DTYPE = EnvStr("bf16")
+    # Test-only: fill the P-side draft-context payload with a deterministic
+    # pattern (no real capture) so the aux channel can be verified end to end.
+    SGLANG_DRAFT_HIDDEN_DEBUG = EnvBool(False)
     SGLANG_DSPARK_FAST_SAMPLING = EnvBool(True)
     SGLANG_DSPARK_FOLDED_SAMPLING = EnvInt(DsparkFoldedSampling.AUTO)
     SGLANG_DSPARK_FOLDED_PROPOSAL = EnvBool(True)

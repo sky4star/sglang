@@ -58,6 +58,7 @@ class DeepseekModelNextN(nn.Module):
         config: PretrainedConfig,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
+        embedding_tp_kwargs: Optional[dict] = None,
     ) -> None:
         super().__init__()
         if enable_nextn_moe_bf16_cast_to_fp8(quant_config):
@@ -69,19 +70,15 @@ class DeepseekModelNextN(nn.Module):
         else:
             moe_quant_config_override = None
 
-        if quant_config is not None and quant_config.get_name() == "modelopt_fp4":
-            logger.debug(
-                "Overriding DeepseekV3ForCausalLMNextN quant config for modelopt_fp4 Deepseek model."
-            )
-            quant_config = None
-
         self.vocab_size = config.vocab_size
 
+        if embedding_tp_kwargs is None:
+            embedding_tp_kwargs = get_embedding_tp_kwargs()
         self.embed_tokens = VocabParallelEmbedding(
             config.vocab_size,
             config.hidden_size,
             prefix=add_prefix("embed_tokens", prefix),
-            **get_embedding_tp_kwargs(),
+            **embedding_tp_kwargs,
         )
 
         self.enorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -165,17 +162,48 @@ class DeepseekModelNextN(nn.Module):
             )
 
             if input_embeds is None:
+                if (
+                    os.environ.get("SGL_DEBUG_DRAFT_IDS") == "1"
+                    and not forward_batch.forward_mode.is_decode()
+                    and not torch.cuda.is_current_stream_capturing()
+                ):
+                    try:
+                        _emb = self.embed_tokens
+                        _ids = input_ids
+                        _n = int(_ids.numel())
+                        _mn = int(_ids.min()) if _n else -1
+                        _mx = int(_ids.max()) if _n else -1
+                        _per = getattr(_emb, "num_embeddings_per_partition", None)
+                        _tot = getattr(_emb, "num_embeddings", None)
+                        _st = getattr(_emb, "vocab_start_index", None)
+                        _oob = (_mn < 0) or (_per is not None and _mx >= _per)
+                        print(
+                            f"[DRAFT-DBG] mode={forward_batch.forward_mode} ids={tuple(_ids.shape)}/{_ids.dtype}"
+                            f" min={_mn} max={_mx} per_part={_per} total={_tot} start={_st}"
+                            f" mm_embeds={forward_batch.mm_input_embeds is not None}"
+                            f" fb_input_embeds={forward_batch.input_embeds is not None} OOB={_oob}",
+                            flush=True,
+                        )
+                        if _oob and _per is not None:
+                            _bad = _ids[(_ids < 0) | (_ids >= _per)]
+                            print(
+                                f"[DRAFT-DBG-OOB] full_ids={_ids.tolist()}"
+                                f" bad={_bad.tolist()[:16]} n_bad={int(_bad.numel())}",
+                                flush=True,
+                            )
+                    except Exception as _e:
+                        print(f"[DRAFT-DBG] err {_e!r}", flush=True)
                 # MM positions in input_ids hold MM_PAD_SHIFT_VALUE+hash sentinels
                 # (far above vocab_size). Use target-produced mm_input_embeds for
                 # these positions and only call embed_tokens on the appended
                 # next-token to avoid embed OOB.
                 input_embeds = forward_batch.mm_input_embeds
                 if (
-                    forward_batch.forward_mode.is_extend()
+                    input_embeds is not None
+                    and forward_batch.forward_mode.is_extend()
                     and forward_batch.contains_mm_inputs()
                     and not forward_batch.forward_mode.is_draft_extend_v2()
                 ):
-                    assert input_embeds is not None
                     last_indices = (
                         forward_batch.extend_start_loc
                         + forward_batch.extend_seq_lens
@@ -274,6 +302,9 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
             return None
         return quant_config
 
+    def _get_nextn_embedding_tp_kwargs(self) -> dict:
+        return get_embedding_tp_kwargs()
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -290,7 +321,10 @@ class DeepseekV3ForCausalLMNextN(DeepseekV3ForCausalLM):
         nextn_quant_config = self._resolve_nextn_quant_config(config, quant_config)
 
         self.model = DeepseekModelNextN(
-            config, nextn_quant_config, prefix=add_prefix("model", prefix)
+            config,
+            nextn_quant_config,
+            prefix=add_prefix("model", prefix),
+            embedding_tp_kwargs=self._get_nextn_embedding_tp_kwargs(),
         )
         self.lm_head = ParallelLMHead(
             config.vocab_size,
