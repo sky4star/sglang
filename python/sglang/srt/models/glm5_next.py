@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 from array import array
 from contextlib import nullcontext
@@ -1070,6 +1071,24 @@ class Glm5NextModel(nn.Module):
             )
         self.layers_to_capture = []
         self.dflash_capture = False
+        # ==== PP tap-capture (env-gated; default off) ====
+        # SGL_PP_TAP_DUMP: dump the combined taps to disk (Test 2).
+        # SGL_DHC_P: capture + relay and return the combined aux hidden so the
+        # scheduler can ship the draft-context hidden to D (Design-B PD).
+        self._pp_tap_dump = os.environ.get("SGL_PP_TAP_DUMP", "")
+        self._dhc_p = bool(os.environ.get("SGL_DHC_P", ""))
+        self._pp_tap_call = 0
+        if self._pp_tap_dump or self._dhc_p:
+            self._pp_tap_ids = [
+                int(x)
+                for x in (
+                    os.environ.get("SGL_DHC_TAPS")
+                    or os.environ.get("SGL_PP_TAPS", "19,27,31,35,39,43")
+                ).split(",")
+            ]
+            self.layers_to_capture = [v + 1 for v in self._pp_tap_ids]
+            self.dflash_capture = True
+        # ==== end PP tap-capture ====
         if (
             get_moe_a2a_backend().is_deepep()
             or get_moe_a2a_backend().is_mooncake()
@@ -1195,6 +1214,57 @@ class Glm5NextModel(nn.Module):
         hidden_states, residual = last_layer.layer_communicator.finish_layer_stack(
             hidden_states, residual, forward_batch
         )
+
+        # ==== PP tap-capture: relay + dump/return (env-gated) ====
+        if self._pp_tap_dump or self._dhc_p:
+            combined = list(aux_hidden_states)
+            if (not self.pp_group.is_first_rank) and pp_proxy_tensors is not None:
+                _pt = getattr(pp_proxy_tensors, "tensors", None)
+                if _pt is not None and "pp_taps" in _pt:
+                    combined = [t for t in _pt["pp_taps"]] + combined
+            if not self.pp_group.is_last_rank:
+                _d = {"hidden_states": hidden_states}
+                if not self.config.mhc:
+                    _d["residual"] = residual
+                if combined:
+                    _d["pp_taps"] = torch.stack(combined, dim=0)
+                return PPProxyTensors(_d)
+            if (
+                self._pp_tap_call == 0
+                and combined
+                and forward_batch.forward_mode.is_extend()
+            ):
+                try:
+                    _r = int(self.pp_group.rank_in_group)
+                    torch.save(
+                        {
+                            "taps": [t.detach().to("cpu") for t in combined],
+                            "num_tokens": int(hidden_states.shape[0]),
+                            "pp_rank": _r,
+                        },
+                        f"{self._pp_tap_dump}/pp_taps_full.pt",
+                    )
+                    print(
+                        f"[PP-TAPS] rank{_r} dumped {len(combined)} taps "
+                        f"tokens={int(hidden_states.shape[0])} (relayed) -> "
+                        f"{self._pp_tap_dump}",
+                        flush=True,
+                    )
+                    self._pp_tap_call = 1
+                except Exception as _e:  # noqa: BLE001
+                    import traceback
+
+                    traceback.print_exc()
+                    print(f"[PP-TAPS] dump error: {_e}", flush=True)
+            if self._dhc_p:
+                # Return the combined (relayed) aux hidden so the top model
+                # unpacks it into logits_output.hidden_states for the scheduler.
+                aux_hidden_states = combined
+            else:
+                # Dump-only: keep the normal return path (caller expects no aux).
+                aux_hidden_states = []
+        # ==== end PP tap-capture ====
+
         if not self.pp_group.is_last_rank:
             if self.config.mhc:
                 return PPProxyTensors({"hidden_states": hidden_states})
@@ -1293,7 +1363,12 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 else {}
             )
         )
-        self.capture_aux_hidden_states = False
+        # Only the last PP stage returns the aux tuple; other stages return
+        # PPProxyTensors, so the flag must be rank-conditional (mirrors
+        # set_dflash_layers_to_capture).
+        self.capture_aux_hidden_states = bool(
+            os.environ.get("SGL_DHC_P", "")
+        ) and get_parallel().pp_group.is_last_rank
 
         if not self.encoder_only:
             get_attn_tp_context().init_context(

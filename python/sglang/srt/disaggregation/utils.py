@@ -15,9 +15,13 @@ from typing import (
     overload,
 )
 
+import logging
+
 import numpy as np
 import torch
 import torch.distributed as dist
+
+logger = logging.getLogger(__name__)
 
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
@@ -382,6 +386,38 @@ class MetadataBuffers:
                 (size, 8), dtype=bootstrap_room_dtype, device=device
             )
 
+            # Draft-context hidden channel (P=PP -> D=spec, Design B). P writes the
+            # tail-window fc-projected aux hidden per request; it rides the PD aux
+            # transfer with the KV and D injects it before the first decode.
+            self.output_draft_ctx_hidden = None
+            self.output_draft_ctx_len = None
+            if envs.SGLANG_DRAFT_HIDDEN_CHANNEL.get():
+                _dch_window = int(envs.SGLANG_DRAFT_HIDDEN_WINDOW.get())
+                _dch_dim = int(envs.SGLANG_DRAFT_HIDDEN_DIM.get())
+                _dch_dtype = {
+                    "bf16": torch.bfloat16,
+                    "fp16": torch.float16,
+                    "fp32": torch.float32,
+                    "fp8": torch.float8_e4m3fn,
+                }.get(str(envs.SGLANG_DRAFT_HIDDEN_DTYPE.get()).lower(), torch.bfloat16)
+                if _dch_window > 0 and _dch_dim > 0:
+                    self.output_draft_ctx_hidden = torch.zeros(
+                        (size, _dch_window, _dch_dim),
+                        dtype=_dch_dtype,
+                        device=device,
+                    )
+                    self.output_draft_ctx_len = torch.zeros(
+                        (size,), dtype=torch.int32, device=device
+                    )
+                    logger.info(
+                        "[DHC] draft-context hidden channel enabled: size=%d "
+                        "window=%d dim=%d dtype=%s",
+                        size,
+                        _dch_window,
+                        _dch_dim,
+                        _dch_dtype,
+                    )
+
         self.kv_checksum: torch.Tensor | None = None
         if kv_checksum_enabled:
             with (
@@ -422,6 +458,11 @@ class MetadataBuffers:
         bufs.append(self.bootstrap_room)
         if self.kv_checksum is not None:
             bufs.append(self.kv_checksum)
+        if self.output_draft_ctx_hidden is not None:
+            # Draft-context hidden channel: registered last so P and D agree on
+            # the aux pointer/length layout as long as the env config matches.
+            bufs.append(self.output_draft_ctx_hidden)
+            bufs.append(self.output_draft_ctx_len)
         bufs = [buf for buf in bufs if buf is not None]
         ptrs = [buf.data_ptr() for buf in bufs]
         data_lens = [buf.nbytes for buf in bufs]
@@ -555,6 +596,38 @@ class MetadataBuffers:
         self.bootstrap_room[req.metadata_buffer_index, 0] = (
             req.bootstrap_room if req.bootstrap_room is not None else 0
         )
+        # Draft-context hidden channel: P-side copy of the windowed + projected
+        # aux hidden. `req.draft_ctx_hidden` is [n, dim] (n <= window).
+        if self.output_draft_ctx_hidden is not None:
+            _dch = getattr(req, "draft_ctx_hidden", None)
+            _win = self.output_draft_ctx_hidden.shape[1]
+            if _dch is not None and _dch.numel() > 0:
+                _n = min(int(_dch.shape[0]), _win)
+                self.output_draft_ctx_hidden[req.metadata_buffer_index, :_n].copy_(
+                    _dch[:_n].to(self.output_draft_ctx_hidden.dtype)
+                )
+                if _n < _win:
+                    self.output_draft_ctx_hidden[req.metadata_buffer_index, _n:].zero_()
+                self.output_draft_ctx_len[req.metadata_buffer_index] = _n
+            else:
+                self.output_draft_ctx_len[req.metadata_buffer_index] = 0
+
+    def get_draft_ctx_hidden(self, idx: int):
+        """D-side read of the draft-context hidden for a request (window, dim)."""
+        if self.output_draft_ctx_hidden is None:
+            return None, 0
+        n = int(self.output_draft_ctx_len[idx].item())
+        if n <= 0:
+            return None, 0
+        return self.output_draft_ctx_hidden[idx, :n].clone(), n
+
+    def clear_draft_ctx(self, idx: int) -> None:
+        """Reset a metadata row so a recycled slot can never hand a stale hidden
+        to the next request. Call on alloc and on release."""
+        if self.output_draft_ctx_hidden is None or idx is None or idx < 0:
+            return
+        self.output_draft_ctx_len[idx] = 0
+        self.output_draft_ctx_hidden[idx].zero_()
 
 
 #########################
