@@ -1605,6 +1605,9 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.req_to_metadata_buffer_idx_allocator.alloc()
             )
             assert decode_req.metadata_buffer_index is not None
+            # Recycled metadata slot: drop any stale draft-context hidden so a
+            # request admitted before P's aux arrives cannot read a stale row.
+            self.metadata_buffers.clear_draft_ctx(decode_req.metadata_buffer_index)
             # int32 for ZMQ serialization -- from_zmq reads np.int32.
             page_indices = kv_to_page_indices(kv_indices, kv_transfer_page_size).astype(
                 np.int32
@@ -2236,6 +2239,19 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             output_dsa_topk_indices,
             output_bootstrap_room,
         ) = self.metadata_buffers.get_buf(idx)
+
+        # Draft-context hidden channel: read the tail-window fc-projected aux
+        # hidden that P wrote into the aux metadata (transferred with the KV).
+        _dch_hidden, _dch_len = self.metadata_buffers.get_draft_ctx_hidden(idx)
+        if _dch_hidden is not None:
+            if envs.SGLANG_DRAFT_HIDDEN_DEBUG.get():
+                print(
+                    f"[DHC-D] idx={idx} got draft_ctx_hidden "
+                    f"shape={tuple(_dch_hidden.shape)} "
+                    f"sum={float(_dch_hidden.float().sum()):.3f}",
+                    flush=True,
+                )
+            decode_req.req.draft_ctx_hidden = _dch_hidden
 
         # Validate bootstrap_room to detect context corruption
         actual_room = output_bootstrap_room[0].item()

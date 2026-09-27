@@ -1257,6 +1257,9 @@ class Req(ReqDllmMixin):
         self.output_topk_p = None
         self.output_topk_index = None
         self.output_dsa_topk_indices = None
+        # Draft-context hidden channel: [n, dim] tail-window fc-projected aux
+        # hidden produced on P and injected into D's draft KV before decode.
+        self.draft_ctx_hidden = None
 
         # capture routed experts
         self.return_routed_experts = return_routed_experts

@@ -1,4 +1,5 @@
 import logging
+import os
 from contextlib import nullcontext
 from dataclasses import replace
 from typing import Callable, Optional, Protocol, runtime_checkable
@@ -620,6 +621,155 @@ class DSparkWorkerV2(BaseSpecWorker):
             if state_slot is not None:
                 state_slot = state_slot[token_indices]
                 final_pos = final_pos[token_indices]
+
+        # ==== DSpark Test-1 debug hooks (env-gated; default no-op) ====
+        if os.environ.get("SGL_DS_TEST1", ""):
+            try:
+                _dir = os.environ.get("SGL_DS_DIR", "/dspark_dbg")
+                os.makedirs(_dir, exist_ok=True)
+                _ctl = {}
+                _ctlp = os.path.join(_dir, "ctl.json")
+                if os.path.exists(_ctlp):
+                    try:
+                        import json as _json
+
+                        _ctl = _json.load(open(_ctlp))
+                    except Exception:  # noqa: BLE001
+                        _ctl = {}
+                _mode = _ctl.get("mode", os.environ.get("SGL_DS_MODE", "dump"))
+                _tag = _ctl.get("tag", "run")
+                _call = getattr(self, "_sgl_ds_call", 0)
+                self._sgl_ds_call = _call + 1
+                _hs = logits_output.hidden_states
+                if "dump" in _mode:
+                    torch.save(
+                        {
+                            "hidden_states": _hs.detach().to("cpu"),
+                            "positions": positions.detach().to("cpu"),
+                            "cache_loc": cache_loc.detach().to("cpu"),
+                            "prefix_lens": list(batch.prefix_lens or []),
+                            "extend_lens": list(batch.extend_lens or []),
+                            "seq_lens": batch.seq_lens.detach().to("cpu"),
+                            "req_pool_indices": batch.req_pool_indices.detach().to("cpu"),
+                            "token_indices": None
+                            if token_indices is None
+                            else token_indices.detach().to("cpu"),
+                        },
+                        f"{_dir}/prefill_{_call:04d}.pt",
+                    )
+                    print(
+                        f"[DS-TEST1] tag={_tag} dump prefill#{_call} "
+                        f"hidden={tuple(_hs.shape)} "
+                        f"prefix_lens={list(batch.prefix_lens or [])} "
+                        f"extend_lens={list(batch.extend_lens or [])} -> {_dir}",
+                        flush=True,
+                    )
+                _already_projected = False
+                _load_raw = _ctl.get("load_raw_path", "")
+                if _load_raw and token_indices is None and os.path.exists(_load_raw):
+                    _blob = torch.load(_load_raw, map_location=_hs.device)
+                    _lh = (
+                        _blob["hidden_states"] if isinstance(_blob, dict) else _blob
+                    ).to(_hs.device)
+                    if tuple(_lh.shape) == tuple(_hs.shape):
+                        logits_output.hidden_states = _lh
+                        _hs = _lh
+                        print(
+                            f"[DS-TEST1] tag={_tag} load RAW {_load_raw} "
+                            f"shape={tuple(_lh.shape)}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[DS-TEST1] load RAW shape mismatch {tuple(_lh.shape)} vs "
+                            f"{tuple(_hs.shape)}; keeping captured",
+                            flush=True,
+                        )
+                _load_proj = _ctl.get("load_proj_path", "")
+                if _load_proj and token_indices is None and os.path.exists(_load_proj):
+                    _blob = torch.load(_load_proj, map_location=_hs.device)
+                    _lh = (
+                        _blob["hidden_states"] if isinstance(_blob, dict) else _blob
+                    ).to(_hs.device)
+                    if (
+                        _lh.ndim == 2
+                        and _lh.shape[0] == _hs.shape[0]
+                        and _lh.shape[-1] != _hs.shape[-1]
+                    ):
+                        logits_output.hidden_states = _lh
+                        _hs = _lh
+                        _already_projected = True
+                        print(
+                            f"[DS-TEST1] tag={_tag} load PROJ {_load_proj} "
+                            f"shape={tuple(_lh.shape)}",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            f"[DS-TEST1] load PROJ shape mismatch {tuple(_lh.shape)} vs "
+                            f"{tuple(_hs.shape)}; keeping captured",
+                            flush=True,
+                        )
+                _w = int(
+                    _ctl.get("window", os.environ.get("SGL_DS_WINDOW", "0"))
+                )
+                if _w > 0:
+                    if token_indices is None:
+                        _keep = []
+                        for _pl, _el in zip(
+                            batch.prefix_lens or [], batch.extend_lens or []
+                        ):
+                            _sl = int(_pl) + int(_el)
+                            for _j in range(int(_el)):
+                                _keep.append((int(_pl) + _j) >= (_sl - _w))
+                        _keep = torch.tensor(
+                            _keep, dtype=torch.bool, device=_hs.device
+                        )
+                        logits_output.hidden_states = _hs[_keep]
+                        cache_loc = cache_loc[_keep]
+                        positions = positions[_keep]
+                        if state_slot is not None:
+                            state_slot = state_slot[_keep]
+                        if final_pos is not None:
+                            final_pos = final_pos[_keep]
+                        print(
+                            f"[DS-TEST1] tag={_tag} window={_w} kept "
+                            f"{int(_keep.sum())}/{len(_keep)} tokens",
+                            flush=True,
+                        )
+                    else:
+                        print(
+                            "[DS-TEST1] window skipped: token_indices is not None",
+                            flush=True,
+                        )
+                _proj = str(
+                    _ctl.get("project", os.environ.get("SGL_DS_PROJECT", "0"))
+                ) not in ("", "0", "False", "false")
+                if _already_projected:
+                    target_hidden_is_projected = True
+                    _proj = False
+                if _proj:
+                    _before = logits_output.hidden_states
+                    _projected = self.draft_model.project_target_hidden(_before)
+                    logits_output.hidden_states = _projected
+                    target_hidden_is_projected = True
+                    print(
+                        f"[DS-TEST1] tag={_tag} project fc {tuple(_before.shape)} "
+                        f"-> {tuple(_projected.shape)}",
+                        flush=True,
+                    )
+                if "zero" in _mode:
+                    logits_output.hidden_states = torch.zeros_like(
+                        logits_output.hidden_states
+                    )
+                    print(f"[DS-TEST1] zeroed hidden prefill#{_call}", flush=True)
+            except Exception as _e:  # noqa: BLE001
+                import traceback
+
+                traceback.print_exc()
+                print(f"[DS-TEST1] hook error: {_e}", flush=True)
+        # ==== end DSpark Test-1 hooks ====
+
         self._kv_injector.inject_target_hidden(
             target_hidden=logits_output.hidden_states,
             cache_loc=cache_loc,
@@ -686,6 +836,75 @@ class DSparkWorkerV2(BaseSpecWorker):
             new_seq_lens=next_draft_input.new_seq_lens,
         )
 
+    def _maybe_inject_prompt_ctx_hidden(self, batch: ScheduleBatch) -> int:
+        """Design-B PD: inject the P-supplied prompt-window hidden into the draft
+        KV once, before the first draft of a request received over PD.
+
+        The hidden is the tail window (<= --draft-context-window) of the 6-tap
+        target aux hidden, already fc-projected by P, so it is injected with
+        ``target_hidden_is_projected=True``.
+        """
+        if not envs.SGLANG_DRAFT_HIDDEN_CHANNEL.get():
+            return 0
+        reqs = getattr(batch, "reqs", None)
+        rtp = getattr(batch, "req_to_token_pool", None)
+        if not reqs or rtp is None:
+            return 0
+        dev = torch.device(self.device)
+        seq_lens = batch.seq_lens
+        pool_indices = batch.req_pool_indices
+        expected_dim = int(getattr(self.draft_model.config, "hidden_size", 0) or 0)
+        injected = 0
+        for i, req in enumerate(reqs):
+            hidden = getattr(req, "draft_ctx_hidden", None)
+            if hidden is None:
+                continue
+            if expected_dim and int(hidden.shape[-1]) != expected_dim:
+                # Guard against a raw-tap payload or a P/D config mismatch;
+                # injecting the wrong width would corrupt the draft KV.
+                logger.warning(
+                    "[DHC-D] draft-context hidden dim %d != draft hidden_size %d; "
+                    "skipping injection for rid=%s",
+                    int(hidden.shape[-1]),
+                    expected_dim,
+                    getattr(req, "rid", None),
+                )
+                req.draft_ctx_hidden = None
+                continue
+            try:
+                L = int(seq_lens[i])
+                n = min(int(hidden.shape[0]), max(L, 0))
+                if n > 0:
+                    start = L - n
+                    positions = torch.arange(start, L, dtype=torch.int64, device=dev)
+                    pidx = int(pool_indices[i])
+                    cache_loc = (
+                        rtp.req_to_token[pidx, start:L].to(torch.int64).to(dev)
+                    )
+                    with torch.inference_mode():
+                        self._kv_injector.inject_target_hidden(
+                            target_hidden=hidden.to(dev),
+                            cache_loc=cache_loc,
+                            positions=positions,
+                            target_hidden_is_projected=True,
+                        )
+                    injected += 1
+                    if envs.SGLANG_DRAFT_HIDDEN_DEBUG.get():
+                        print(
+                            f"[DHC-D-INJ] rid={req.rid} L={L} n={n} start={start} "
+                            f"sum={float(hidden.float().sum()):.3f}",
+                            flush=True,
+                        )
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "draft-context hidden injection failed for rid=%s: %s",
+                    getattr(req, "rid", None),
+                    e,
+                )
+            finally:
+                req.draft_ctx_hidden = None
+        return injected
+
     def _forward_decode(
         self, batch: ScheduleBatch, on_publish, grammar_barrier=None
     ) -> GenerationBatchResult:
@@ -713,6 +932,10 @@ class DSparkWorkerV2(BaseSpecWorker):
         bs = len(batch.seq_lens)
         device = self.device
         prefix_lens = batch.seq_lens
+
+        # Design-B PD: prime the draft KV from the P-supplied prompt-window hidden
+        # before the first proposal of a freshly received decode request.
+        self._maybe_inject_prompt_ctx_hidden(batch)
 
         self._observers.begin_step()
 
