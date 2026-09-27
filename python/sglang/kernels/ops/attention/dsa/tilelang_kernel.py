@@ -71,6 +71,13 @@ def fast_round_scale(amax, fp8_max_inv):
     return fast_pow2(fast_log2_ceil(amax * fp8_max_inv))
 
 
+@lru_cache(maxsize=1)
+def _cuda_sm_count() -> int:
+    return torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+
+
 @lru_cache(maxsize=8)
 def _pick_inner_iter(seq: int, ni: int, cu: int, block_per_cu: int) -> int:
     """
@@ -155,9 +162,9 @@ def act_quant(
             - A tensor of scaling factors with dtype `torch.float32`.
     """
     assert x.is_contiguous(), "Input tensor must be contiguous"
-    assert x.size(-1) % block_size == 0, (
-        f"Last dimension size must be divisible by block_size (block_size={block_size})"
-    )
+    assert (
+        x.size(-1) % block_size == 0
+    ), f"Last dimension size must be divisible by block_size (block_size={block_size})"
     N = x.size(-1)
     if _is_fp8_fnuz:
         y = torch.empty_like(x, dtype=torch.float8_e4m3fnuz)
@@ -268,21 +275,22 @@ def sparse_attention_fwd_kernel_v1(
     kv_group=1,
     sm_scale=None,
     is_causal=True,
-    block_I=64,
-    num_stages=2,
-    threads=256,
+    block_I=32,
+    num_stages=1,
+    threads=128,
+    return_lse=False,
 ):
-    assert dim == tilelang.math.next_power_of_2(dim) or dim % 64 == 0, (
-        f"dim={dim} must be a power of 2 or a multiple of 64"
-    )
-    assert tail_dim == 0 or tail_dim == tilelang.math.next_power_of_2(tail_dim), (
-        f"tail_dim={tail_dim} must be 0 or a power of 2"
-    )
+    assert (
+        dim == tilelang.math.next_power_of_2(dim) or dim % 64 == 0
+    ), f"dim={dim} must be a power of 2 or a multiple of 64"
+    assert tail_dim == 0 or tail_dim == tilelang.math.next_power_of_2(
+        tail_dim
+    ), f"tail_dim={tail_dim} must be 0 or a power of 2"
     has_tail = tail_dim > 0
     assert is_causal == True, "non-casual is not supported"
-    assert topk % block_I == 0, (
-        "otherwise will load some index=0 thus causing wrong kv to be loaded"
-    )
+    assert (
+        topk % block_I == 0
+    ), "otherwise will load some index=0 thus causing wrong kv to be loaded"
     if sm_scale is None:
         sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504  # log2(e)
     else:
@@ -296,6 +304,7 @@ def sparse_attention_fwd_kernel_v1(
     q_shape = [batch, seq_len, num_heads, dim + tail_dim]
     kv_shape = [batch, seq_len_kv, kv_group, dim + tail_dim]
     o_shape = [batch, seq_len, num_heads, dim]
+    lse_shape = [batch, seq_len, num_heads]
     indices_shape = [batch, seq_len, kv_group, topk]
     indices_dtype = "int32"
     dtype = "bfloat16"
@@ -323,6 +332,7 @@ def sparse_attention_fwd_kernel_v1(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
         KV: T.Tensor(kv_shape, dtype),  # type: ignore
         Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
+        LSE: T.Tensor(lse_shape, accum_dtype),  # type: ignore
         Output: T.Tensor(o_shape, dtype),  # type: ignore
     ):
         with T.Kernel(seq_len * REPLICATE_H, batch, kv_group, threads=threads) as (
@@ -365,6 +375,7 @@ def sparse_attention_fwd_kernel_v1(
                 T.copy(Q[b_i, s_i, H0:H1, D:], Q_tail_shared)
 
             for i_i in T.Pipelined(NI, num_stages=num_stages):
+
                 for bi_i in T.Parallel(BI):
                     mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] >= 0
 
@@ -422,6 +433,8 @@ def sparse_attention_fwd_kernel_v1(
                 acc_o[h_i, d_i] /= sumexp[h_i]
             for h_i in T.Parallel(H_per_block):
                 sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
+            if return_lse:
+                T.copy(sumexp, LSE[b_i, s_i, H0:H1])
 
             T.copy(acc_o, O_shared)
             T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
@@ -452,22 +465,23 @@ def sparse_attention_fwd_kernel_v2(
     *,
     kv_group: int = 1,
     sm_scale: Optional[float] = None,
-    block_I: int = 64,
+    block_I: int = 32,
+    return_lse: bool = False,
 ):
-    assert dim == tilelang.math.next_power_of_2(dim), (
-        f"haven't check padding correctness yet, dim={dim}"
-    )
-    assert tail_dim == tilelang.math.next_power_of_2(tail_dim), (
-        f"haven't check padding correctness yet, dim={tail_dim}"
-    )
-    assert topk % block_I == 0, (
-        "otherwise will load some index=0 thus causing wrong kv to be loaded"
-    )
+    assert dim == tilelang.math.next_power_of_2(
+        dim
+    ), f"haven't check padding correctness yet, dim={dim}"
+    assert tail_dim == tilelang.math.next_power_of_2(
+        tail_dim
+    ), f"haven't check padding correctness yet, dim={tail_dim}"
+    assert (
+        topk % block_I == 0
+    ), "otherwise will load some index=0 thus causing wrong kv to be loaded"
     if sm_scale is None:
         sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504  # log2(e)
     else:
         sm_scale = sm_scale * 1.44269504  # log2(e)
-    threads = 384
+    threads = 128
 
     batch = T.symbolic("batch")
     qo_len = T.symbolic("seq_len")
@@ -476,6 +490,7 @@ def sparse_attention_fwd_kernel_v2(
     q_shape = [batch, qo_len, num_heads, dim + tail_dim]
     kv_shape = [batch, num_pages, kv_group, dim + tail_dim]
     o_shape = [batch, qo_len, num_heads, dim]
+    lse_shape = [batch, qo_len, num_heads]
     indices_shape = [batch, qo_len, kv_group, topk]
 
     indices_dtype = "int32"
@@ -504,6 +519,7 @@ def sparse_attention_fwd_kernel_v2(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
         KV: T.Tensor(kv_shape, dtype),  # type: ignore
         Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
+        LSE: T.Tensor(lse_shape, accum_dtype),  # type: ignore
         Output: T.Tensor(o_shape, dtype),  # type: ignore
     ):
         """
@@ -671,6 +687,8 @@ def sparse_attention_fwd_kernel_v2(
                     acc_o_l[h_i, d_i] /= sumexp[h_i]
                 for h_i in T.Parallel(H_per_block):
                     sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
+                if return_lse:
+                    T.copy(sumexp, LSE[b_i, s_i, H0:H1])
                 T.copy(acc_o_l, O_shared_l)
                 T.copy(O_shared_l, Output[b_i, s_i, H0:H1, 0 : D // 2])
             elif tx >= 128 and tx < 256:
@@ -825,10 +843,10 @@ def sparse_mla_fwd_decode_partial(
     kv_group=1,
     sm_scale=None,
     is_causal=True,
-    block_I=64,
+    block_I=32,
     inner_iter=1,
     num_stages=1,
-    threads=256,
+    threads=128,
 ):
     """
     grid: (seq_len * REPLICATE_H, top_k / block_I / inner_iter)
@@ -1000,8 +1018,8 @@ def sparse_mla_fwd_decode_combine(
     topk,
     head_per_block,
     *,
-    block_I=64,
-    threads=256,
+    block_I=32,
+    threads=128,
 ):
     """
     grid: (seq_len * REPLICATE_H). batch=1, kv_group=1.
@@ -1081,14 +1099,14 @@ def sparse_mla_fwd_decode_partial_fp8(
     topk: int,
     *,
     sm_scale=None,
-    block_I=64,
+    block_I=32,
     inner_iter=1,
-    threads=256,
+    threads=128,
 ):
     assert d_v == 512, f"only support d_v=512"
-    assert topk % block_I == 0, (
-        "otherwise will load some index=0 thus causing wrong kv to be loaded"
-    )
+    assert (
+        topk % block_I == 0
+    ), "otherwise will load some index=0 thus causing wrong kv to be loaded"
 
     # Softmax scores are in [0, 1]. We scale by fp8_max_val before FP8 cast
     # to better utilize FP8 dynamic range, then apply the inverse scale after GEMM.
@@ -1112,9 +1130,9 @@ def sparse_mla_fwd_decode_partial_fp8(
     h_per_block = 16
     # Match bf16 partial behavior: keep fixed 16-head tiles and use
     # sliced T.copy on H0:H1 for tail handling.
-    assert num_heads <= h_per_block or num_heads % h_per_block == 0, (
-        "num_heads must be <=16 or divisible by 16"
-    )
+    assert (
+        num_heads <= h_per_block or num_heads % h_per_block == 0
+    ), "num_heads must be <=16 or divisible by 16"
     head_blocks_per_seq = (num_heads + h_per_block - 1) // h_per_block
 
     batch = 1
@@ -1160,8 +1178,9 @@ def sparse_mla_fwd_decode_partial_fp8(
             kv_tile1 = T.alloc_shared([BI, group_size], fp8_dtype)
             kv_tile2 = T.alloc_shared([BI, group_size], fp8_dtype)
             kv_tile3 = T.alloc_shared([BI, group_size], fp8_dtype)
-            q_tail_buf = T.alloc_shared([h_per_block, d_tail], fp8_dtype)
-            k_tail_shared = T.alloc_shared([BI, d_tail], fp8_dtype)
+            if d_tail > 0:
+                q_tail_buf = T.alloc_shared([h_per_block, d_tail], fp8_dtype)
+                k_tail_shared = T.alloc_shared([BI, d_tail], fp8_dtype)
             s_fp8_shared = T.alloc_shared([h_per_block, BI], fp8_dtype)
             page_idx_shared = T.alloc_shared([BI], T.int32)
 
@@ -1188,7 +1207,8 @@ def sparse_mla_fwd_decode_partial_fp8(
             T.fill(sumexp, 0)
             T.fill(m_i, -(2**30))
 
-            T.copy(q_fp8[b_i, s_i, H0:H1, d_v:], q_tail_buf)
+            if d_tail > 0:
+                T.copy(q_fp8[b_i, s_i, H0:H1, d_v:], q_tail_buf)
             T.copy(q_fp8[b_i, s_i, H0:H1, 0 * group_size : 1 * group_size], q_tile0)
             T.copy(q_fp8[b_i, s_i, H0:H1, 1 * group_size : 2 * group_size], q_tile1)
             T.copy(q_fp8[b_i, s_i, H0:H1, 2 * group_size : 3 * group_size], q_tile2)
@@ -1210,9 +1230,10 @@ def sparse_mla_fwd_decode_partial_fp8(
                     kv_tile2[bi_i, j] = kv_fp8[b_i, page, g_i, 2 * group_size + j]
                     kv_tile3[bi_i, j] = kv_fp8[b_i, page, g_i, 3 * group_size + j]
 
-                for bi_i, j in T.Parallel(BI, d_tail):
-                    page = page_idx_shared[bi_i]
-                    k_tail_shared[bi_i, j] = kv_fp8[b_i, page, g_i, rope_offset_fp8 + j]
+                if d_tail > 0:
+                    for bi_i, j in T.Parallel(BI, d_tail):
+                        page = page_idx_shared[bi_i]
+                        k_tail_shared[bi_i, j] = kv_fp8[b_i, page, g_i, rope_offset_fp8 + j]
 
                 for h_i, bi_i in T.Parallel(h_per_block, BI):
                     acc_s[h_i, bi_i] = T.if_then_else(
@@ -1229,13 +1250,14 @@ def sparse_mla_fwd_decode_partial_fp8(
                 T.gemm(q_tile3, kv_tile3, acc_tile, transpose_B=True, clear_accum=True)
                 for h_i, bi_i in T.Parallel(h_per_block, BI):
                     acc_s[h_i, bi_i] += acc_tile[h_i, bi_i]
-                T.gemm(
-                    q_tail_buf,
-                    k_tail_shared,
-                    acc_s,
-                    transpose_B=True,
-                    policy=T.GemmWarpPolicy.FullCol,
-                )
+                if d_tail > 0:
+                    T.gemm(
+                        q_tail_buf,
+                        k_tail_shared,
+                        acc_s,
+                        transpose_B=True,
+                        policy=T.GemmWarpPolicy.FullCol,
+                    )
 
                 T.copy(m_i, m_i_prev)
                 T.reduce_max(acc_s, m_i, dim=1, clear=False)
@@ -1328,6 +1350,7 @@ def tilelang_sparse_fwd(
     indices: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
+    return_lse: bool = False,
 ) -> torch.Tensor:
     assert q.dim() == 3 and kv.dim() == 3 and indices.dim() == 3
     num_heads = q.shape[1]
@@ -1336,12 +1359,20 @@ def tilelang_sparse_fwd(
     topk = indices.shape[-1]
     assert topk % 64 == 0, "topk must be padded to a multiple of 64"
 
-    if _is_hip:
-        is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    if _is_hip or is_fp8_kv:
+        assert not return_lse, "tilelang partial+combine sparse fwd does not return LSE"
         if is_fp8_kv:
             if q.dtype != kv.dtype:
                 q = q.to(kv.dtype)
-            if _is_gfx95_supported:
+            if not _is_hip:
+                # CUDA: the fp8 partial kernel is generic TileLang (no HIP
+                # intrinsics). Tiles sized for the ~100 KB dynamic-smem class
+                # (SM12x): fp8 K tiles are half the bytes of bf16, so
+                # block_I=32/threads=128 uses ~25 KB smem and block_I=64
+                # would use ~42 KB; 32/128 is the shape validated on GB10.
+                block_I, threads, block_per_cu, cu = 32, 128, 1, _cuda_sm_count()
+            elif _is_gfx95_supported:
                 block_I, threads, block_per_cu, cu = 64, 256, 2, 256
             else:
                 block_I, threads, block_per_cu, cu = 64, 256, 1, 304
@@ -1393,8 +1424,17 @@ def tilelang_sparse_fwd(
             if tail_dim == 0
             else sparse_attention_fwd_kernel_v2
         )
-        kernel = kernel_factory(num_heads, d_v, tail_dim, topk, sm_scale=sm_scale)
-        out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
+        kernel = kernel_factory(
+            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, return_lse=return_lse
+        )
+        # Caller-allocated LSE (in-place kernel arg): written only by kernels
+        # traced with return_lse=True, but the prim_func signature always has it.
+        lse = torch.empty(
+            (1, q.shape[0], num_heads), dtype=torch.float32, device=q.device
+        )
+        out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0), lse)  # type: ignore
+    if return_lse:
+        return out, lse
     return out
 
 
@@ -1587,7 +1627,7 @@ def dpsk_v4_fp8_partial_kernel(
     dim: int = 448,
     tail_dim: int = 64,
     sm_scale: float = 0.0,
-    block_I: int = 64,
+    block_I: int = 32,
     inner_iter_1: int = 1,
     inner_iter_2: int = 0,
     num_stages: int = 0,
@@ -1605,7 +1645,9 @@ def dpsk_v4_fp8_partial_kernel(
         sm_scale = sm_scale * log2e
     assert dim == 448 and tail_dim == 64
     assert topk_1 % block_I == 0
-    assert (topk_1 // block_I) % inner_iter_1 == 0, (
+    assert (
+        topk_1 // block_I
+    ) % inner_iter_1 == 0, (
         f"NI_1={topk_1 // block_I} must be divisible by inner_iter_1={inner_iter_1}"
     )
     assert block_size_kv_1 > 0 and (block_size_kv_1 & (block_size_kv_1 - 1)) == 0
@@ -1614,7 +1656,9 @@ def dpsk_v4_fp8_partial_kernel(
     if is_dual:
         assert inner_iter_2 > 0, "dual-cache call requires inner_iter_2 > 0"
         assert topk_2 % block_I == 0
-        assert (topk_2 // block_I) % inner_iter_2 == 0, (
+        assert (
+            topk_2 // block_I
+        ) % inner_iter_2 == 0, (
             f"NI_2={topk_2 // block_I} must be divisible by inner_iter_2={inner_iter_2}"
         )
         assert block_size_kv_2 > 0 and (block_size_kv_2 & (block_size_kv_2 - 1)) == 0
@@ -2219,7 +2263,7 @@ def dpsk_v4_combine_kernel(
     n_groups_1: int,
     n_groups_2: int = 0,
     *,
-    block_I: int = 64,
+    block_I: int = 32,
     inner_iter_1: int = 1,
     inner_iter_2: int = 1,
     dim: int = 448,
@@ -2263,8 +2307,12 @@ def dpsk_v4_combine_kernel(
 
         @T.prim_func
         def main(
-            Partial_O: T.Tensor([batch, seq_len, n_groups, num_heads, DT], BF16),  # type: ignore
-            Partial_LSE: T.Tensor([batch, seq_len, n_groups, num_heads], accum_dtype),  # type: ignore
+            Partial_O: T.Tensor(
+                [batch, seq_len, n_groups, num_heads, DT], BF16
+            ),  # type: ignore
+            Partial_LSE: T.Tensor(
+                [batch, seq_len, n_groups, num_heads], accum_dtype
+            ),  # type: ignore
             Topk_length_1: T.Tensor([batch], INT32),  # type: ignore
             Topk_length_2: T.Tensor([batch], INT32),  # type: ignore
             Attn_sink: T.Tensor([num_heads], FP32),  # type: ignore
@@ -2372,8 +2420,12 @@ def dpsk_v4_combine_kernel(
 
     @T.prim_func
     def main(
-        Partial_O: T.Tensor([batch, seq_len, n_groups, num_heads, DT], BF16),  # type: ignore
-        Partial_LSE: T.Tensor([batch, seq_len, n_groups, num_heads], accum_dtype),  # type: ignore
+        Partial_O: T.Tensor(
+            [batch, seq_len, n_groups, num_heads, DT], BF16
+        ),  # type: ignore
+        Partial_LSE: T.Tensor(
+            [batch, seq_len, n_groups, num_heads], accum_dtype
+        ),  # type: ignore
         Attn_sink: T.Tensor([num_heads], FP32),  # type: ignore
         Output: T.Tensor([batch, seq_len, num_heads, DT], BF16),  # type: ignore
         LSE: T.Tensor([batch, seq_len, num_heads], accum_dtype),  # type: ignore

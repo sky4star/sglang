@@ -632,14 +632,28 @@ def _check_dsa_backend_constraints(
             "(flashmla_kv on Hopper, trtllm on Blackwell)."
         )
 
-    cuda_fp8_unsupported = {"tilelang"} & chosen
-    if not hip and kv_cache_dtype == "fp8_e4m3" and cuda_fp8_unsupported:
-        raise ValueError(
-            f"The {'/'.join(sorted(cuda_fp8_unsupported))} DSA prefill/decode kernels "
-            "only support an fp8_e4m3 KV cache on ROCm/HIP; on CUDA they require "
-            "a bfloat16 KV cache. Use --kv-cache-dtype bfloat16, or keep "
-            "--kv-cache-dtype fp8_e4m3 and pick an fp8-capable DSA backend "
-            "(flashmla_kv on Hopper, trtllm on Blackwell)."
+    if not hip and kv_cache_dtype == "fp8_e4m3" and "tilelang" in chosen:
+        # DGX/GB10 (#36904): CUDA TileLang fp8 path stores the raw MLA KV layout;
+        # require both DSA backends tilelang and SM89+ for fp8 tensor-core MMA.
+        if prefill_backend != decode_backend:
+            raise ValueError(
+                "On CUDA, an fp8_e4m3 KV cache with a tilelang DSA backend requires "
+                "BOTH --dsa-prefill-backend and --dsa-decode-backend to be tilelang "
+                f"(got prefill={prefill_backend}, decode={decode_backend})."
+            )
+        import torch
+
+        major, minor = torch.cuda.get_device_capability()
+        if major * 10 + minor < 89:
+            raise ValueError(
+                "The tilelang DSA fp8_e4m3 KV path on CUDA requires fp8 tensor-core "
+                f"MMA (SM89+); got sm_{major}{minor}. Use --kv-cache-dtype bfloat16 "
+                "with the tilelang backend, or pick an fp8-capable DSA backend."
+            )
+        logger.warning(
+            "Enabling the tilelang DSA fp8_e4m3 KV cache on CUDA: KV is stored as "
+            "raw fp8 (no per-tile scales), matching the ROCm tilelang path. Expect "
+            "a small accuracy delta vs a bfloat16 KV cache."
         )
 
 
