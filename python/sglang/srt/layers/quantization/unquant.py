@@ -95,6 +95,9 @@ _cutedsl_bf16_gemm = None
 _use_cutedsl_bf16_gemm = None
 _hopper_bf16_gemv = None
 _use_hopper_bf16_gemv = None
+_sm120_bf16_gemv = None
+_sm120_bf16_gemv_out = None
+_use_sm120_bf16_gemv = None
 _splitk_tactic = None
 _run_splitk_dense = None
 _direct_default_tactic = None
@@ -271,6 +274,21 @@ def initialize_bf16_gemm_config() -> None:
         _prefer_direct = prefer_direct_bf16_gemm_sm100
         _run_direct_dense = run_direct_dense
         _enable_bf16_splitk_gemm = True
+
+    # SM120/SM121 (consumer/workstation Blackwell incl. GB10 Grace-Blackwell):
+    # no cutedsl path, so bf16 decode linears fall through to cuBLAS. Enable the
+    # native bf16 GEMV fast path for the shapes where it beats cuBLAS.
+    global _sm120_bf16_gemv, _sm120_bf16_gemv_out, _use_sm120_bf16_gemv
+    if torch.cuda.get_device_capability()[0] == 12:
+        from sglang.kernels.ops.gemm.sm120_bf16_gemv import (
+            sm120_bf16_gemv,
+            sm120_bf16_gemv_out,
+            use_sm120_bf16_gemv,
+        )
+
+        _sm120_bf16_gemv = sm120_bf16_gemv
+        _sm120_bf16_gemv_out = sm120_bf16_gemv_out
+        _use_sm120_bf16_gemv = use_sm120_bf16_gemv
 
     _BF16_GEMM_BACKEND = backend
 
@@ -498,6 +516,19 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 return bf16_gemm_dispatch(x, layer.weight, bias)
             return _bf16_gemm_dispatch_impl(x, layer.weight, bias)
 
+        elif (
+            _use_sm120_bf16_gemv is not None
+            and bias is None
+            and x.is_cuda
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.bfloat16
+            and not layer.weight.requires_grad
+            and _use_sm120_bf16_gemv(
+                x.numel() // x.shape[-1], layer.weight.shape[0], layer.weight.shape[1]
+            )
+        ):
+            return _sm120_bf16_gemv(x, layer.weight)
+
         return F.linear(x, layer.weight, bias)
 
     def apply_with_addend(
@@ -564,6 +595,24 @@ class UnquantizedLinearMethod(LinearMethodBase):
             )
 
             return cutedsl_bf16_gemm_out(x, layer.weight, output, bias)
+
+        if (
+            _use_sm120_bf16_gemv is not None
+            and bias is None
+            and x.is_cuda
+            and x.ndim == 2
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.bfloat16
+            and output.dtype == torch.bfloat16
+            and output.is_contiguous()
+            and output.shape == (x.shape[0], layer.weight.shape[0])
+            and not layer.weight.requires_grad
+            and _use_sm120_bf16_gemv(
+                x.shape[0], layer.weight.shape[0], layer.weight.shape[1]
+            )
+        ):
+            _sm120_bf16_gemv_out(x, layer.weight, output)
+            return output
 
         if x.ndim != 2:
             raise ValueError("caller-owned linear output currently requires a 2D input")
