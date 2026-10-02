@@ -1,26 +1,31 @@
 # TileLang NVFP4 block-scaled fused MoE (SM120a / GB10)
 
-A reference, fully-fused routed MoE implemented entirely in TileLang's SM120
-block-scaled path, targeting NVIDIA GB10 (DGX Spark, sm_121a). It matches the
-production `flashinfer.fused_moe.cutlass_fused_moe` (TRT-LLM CUTLASS) baseline at
-M=4096 with exact numerics.
+A reference routed MoE implemented entirely in TileLang's SM120 block-scaled
+path, targeting NVIDIA GB10 (DGX Spark, sm_121a). It **beats the production
+`flashinfer.fused_moe.cutlass_fused_moe` (TRT-LLM CUTLASS) baseline by ~1.16x**
+at M=4096..16384, with exact numerics.
 
 This is a standalone reference kernel package, not yet wired into the SGLang
 `moe_runner` backends.
 
 ## Structure
 
-Four kernels (vs ~5 in the CUDA baseline):
+Five kernels (vs ~5 in the CUDA baseline, but with different fusion):
 
 | kernel | file | role |
 |---|---|---|
 | K0 | `act_quant_kernel.py` | gather tokens by expert + NVFP4 block-16 quant |
 | K1 | `w13_swiglu_kernel.py` | grouped w13 with **gate+up dual block-scaled MMA** + fused SwiGLU(limit) |
 | K2 | `act_quant_kernel.py` | requant activated intermediate to NVFP4 |
-| K3 | `w2_scatter_kernel.py` | grouped w2 block-scaled GEMM + routing weight + atomic scatter |
+| K3 | `w2_gemm_kernel.py` | grouped w2 block-scaled GEMM, expert-ordered output |
+| C | `moe_combine_kernel.py` | gather-reduction finalize: `y[t] = sum_s out2[slot_rows[t,s]] * scale` |
 
-`fused_moe.py` wires them and validates against a dequant-operand oracle.
+`fused_moe.py` wires the pipeline and validates against a dequant-operand oracle.
 `grouped_nvfp4_gemm.py` holds the base grouped GEMM and the scale-layout helpers.
+
+The combine is a **gather-reduction, not an atomic scatter**: each token's
+`topk` rows are gathered and summed (no contention), which hits the memory
+floor. A fused atomic-scatter variant measured ~2 ms slower and is not included.
 
 ## Requirements
 
@@ -42,23 +47,31 @@ cd python/sglang/srt/layers/moe/tilelang_nvfp4
 python fused_moe.py --M 4096 --E 144 --K 4096 --N 2048
 ```
 
-## Result (GB10, M=4096, E=144/rank, topk=8, K=4096, N=2048)
+## Result (GB10, E=144/rank, topk=8, K=4096, N=2048)
 
-| kernel | ms |
+| kernel | M=4096 (ms) |
 |---|---:|
-| K0 gather+quant | 0.71 |
-| K1 w13+SwiGLU | 7.65 |
-| K2 requant | 0.88 |
-| K3 w2+scatter | 8.50 |
-| **total** | **17.74** |
-| `cutlass_fused_moe` (same shapes) | 17.73 |
+| K0 gather+quant | 0.76 |
+| K1 w13+SwiGLU | 7.49 |
+| K2 requant | 0.90 |
+| K3 w2 GEMM | 4.70 |
+| C combine | 1.46 |
+| **total** | **15.31** |
+| `cutlass_fused_moe` | 17.73 |
+| **speedup** | **1.16x** |
 
 Correctness: exact against a dequant-operand oracle (`max_rel = 0`).
 
+| M | TileLang | baseline | speedup |
+|---:|---:|---:|---:|
+| 4096 | 15.31 | 17.73 | 1.16x |
+| 8192 | 24.04 | 28.20 | 1.17x |
+| 16384 | 44.18 | 51.76 | 1.17x |
+
 ## Notes / caveats
 
-- Matching, not beating: the grouped NVFP4 GEMM is weight/latency bound
-  (each expert's weights serve only ~`M*topk/E` rows).
+- The grouped NVFP4 GEMMs are weight/latency bound; the win comes from fusion
+  (gather+quant, w13+SwiGLU, gather-reduction combine), not from the GEMMs.
 - Disabling TileLang warp specialization is required for the dual-accumulator
   kernel (otherwise it spills `~1.2e8` times).
 - Quant convention here is absolute E4M3 block-16 scales (`sf = E4M3(amax/6)`);

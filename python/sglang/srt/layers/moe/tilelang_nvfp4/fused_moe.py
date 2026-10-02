@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Fully-fused TileLang MoE (M1/M2):
+"""Fully-fused TileLang MoE (plan A: no atomic scatter):
 
     K0 gather+quant   : X, token_ids -> A1 fp4 + E4M3 scales (blockscaled layout)
     K1 w13 gate+up dual block-scaled MMA + fused SwiGLU -> act bf16
     K2 requant        : act -> A2 fp4 + scales
-    K3 w2 block-scaled GEMM + fused routing-weight + atomic scatter -> y
+    K3 w2 block-scaled GEMM -> out2 (expert-ordered, contiguous)
+    C  moe_combine    : gather-reduction y[t] = sum_s out2[slot_rows[t,s]] * scale
 
 Target: match flashinfer.cutlass_fused_moe (~17.7 ms at M=4096).
 
@@ -27,14 +28,16 @@ try:
         pack_scale_words, swizzle_chunk_kmajor, decode_fp4, decode_scale_words,
     )
     from .w13_swiglu_kernel import w13_swiglu
-    from .w2_scatter_kernel import w2_scatter
+    from .w2_gemm_kernel import w2_gemm
+    from .moe_combine_kernel import moe_combine
     from .act_quant_kernel import gather_quant
 except ImportError:
     from grouped_nvfp4_gemm import (
         pack_scale_words, swizzle_chunk_kmajor, decode_fp4, decode_scale_words,
     )
     from w13_swiglu_kernel import w13_swiglu
-    from w2_scatter_kernel import w2_scatter
+    from w2_gemm_kernel import w2_gemm
+    from moe_combine_kernel import moe_combine
     from act_quant_kernel import gather_quant
 
 BLOCK_K = 128
@@ -127,11 +130,21 @@ def main():
     k2(act, src_identity, padded, A2, SFA2sem)
     SFA2 = swizzle_chunk_kmajor(pack_scale_words(SFA2sem.view(torch.uint8))).reshape(-1, words)
 
-    # ---- K3 ----
-    row_scale = (1.0 / w2_gs).repeat_interleave(counts_dev) * row_w
-    y = torch.zeros(M, K, device=dev, dtype=torch.float32)
-    k3 = w2_scatter(E, K, N, M, rows, bpe, block_N=BLOCK_K)
-    k3(A2, w2_q, SFA2, SFB2, offsets, token_ids, row_scale, y)
+    # ---- K3: w2 GEMM (expert-ordered output) ----
+    out2 = torch.empty(rows, K, device=dev, dtype=torch.bfloat16)
+    k3 = w2_gemm(E, K, N, rows, bpe, block_N=BLOCK_K)
+    k3(A2, w2_q, SFA2, SFB2, offsets, out2)
+
+    # ---- combine: gather-reduction over topk ----
+    row_scale = (1.0 / w2_gs).repeat_interleave(counts_dev) * row_w  # per gathered row
+    slot_of_row = (order % topk).to(torch.int64)                      # [rows]
+    slot_rows = torch.empty(M, topk, device=dev, dtype=torch.int64)
+    slot_rows[token_ids.long(), slot_of_row] = torch.arange(rows, device=dev)
+    slot_scale = row_scale[slot_rows].float().contiguous()
+    slot_rows32 = slot_rows.to(torch.int32).contiguous()
+    y = torch.empty(M, K, device=dev, dtype=torch.float32)
+    kc = moe_combine(M, rows, K, topk)
+    kc(out2, slot_rows32, slot_scale, y)
     torch.cuda.synchronize()
 
     if not args.no_verify:
@@ -154,7 +167,7 @@ def main():
         wud = (decode_fp4(wu_q.reshape(E * N, K // 2), E * N, K).reshape(E, N, K)
                * deq_e4m3(wu_sf).reshape(E, N, K // 16).repeat_interleave(16, dim=2)) / wu_gs.view(E, 1, 1)
         w2d = (decode_fp4(w2_q.reshape(E * K, N // 2), E * K, N).reshape(E, K, N)
-               * deq_e4m3(w2_sf).reshape(E, K, N // 16).repeat_interleave(16, dim=2)) / w2_gs.view(E, 1, 1)
+               * deq_e4m3(w2_sf).reshape(E, K, N // 16).repeat_interleave(16, dim=2))
         y_ref = torch.zeros(M, K, device=dev, dtype=torch.float32)
         for e in range(E):
             s0, s1 = int(offsets[e]), int(offsets[e + 1])
@@ -165,7 +178,7 @@ def main():
             u_ = a @ wud[e].t()
             act_ref = F.silu(g_.clamp(max=args.lim)) * u_.clamp(-args.lim, args.lim)
             # A2 was quantized from act_ref, so use the dequantized A2 for the oracle
-            o = A2d[s0:s1] @ w2d[e].t()
+            o = (A2d[s0:s1] @ w2d[e].t()).to(torch.bfloat16).float() * (1.0 / w2_gs[e])
             y_ref.index_add_(0, token_ids[s0:s1].long(), o * row_w[s0:s1].unsqueeze(1))
         err = (y - y_ref).abs()
         rel = err.max().item() / (y_ref.abs().max().item() + 1e-6)
@@ -186,9 +199,10 @@ def main():
     t0 = bench(lambda: k0(X, token_ids, padded, A1, SFA1sem))
     t1 = bench(lambda: k1(A1, wg_q, wu_q, SFA1, SFBg, SFBu, offsets, scale1, act))
     t2 = bench(lambda: k2(act, src_identity, padded, A2, SFA2sem))
-    t3 = bench(lambda: (y.zero_(), k3(A2, w2_q, SFA2, SFB2, offsets, token_ids, row_scale, y)))
-    print(f"K0={t0:.3f}  K1={t1:.3f}  K2={t2:.3f}  K3={t3:.3f} ms   total={t0+t1+t2+t3:.3f} ms "
-          f"(baseline cutlass_fused_moe ~17.73)")
+    t3 = bench(lambda: k3(A2, w2_q, SFA2, SFB2, offsets, out2))
+    t4 = bench(lambda: kc(out2, slot_rows32, slot_scale, y))
+    print(f"K0={t0:.3f}  K1={t1:.3f}  K2={t2:.3f}  K3(w2)={t3:.3f}  combine={t4:.3f} ms   "
+          f"total={t0+t1+t2+t3+t4:.3f} ms (baseline cutlass_fused_moe ~17.73)")
 
 
 if __name__ == "__main__":
