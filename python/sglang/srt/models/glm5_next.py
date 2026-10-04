@@ -1795,3 +1795,25 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
 
 EntryClass = [Glm5NextForConditionalGeneration]
+
+
+# [tlmoe] AOT precompile hook: compile the TileLang NVFP4 MoE kernels during
+# engine init (after weight load, before serving) on every TP rank — symmetric,
+# outside the serving watchdog. No-op unless SGLANG_TILELANG_MOE=1.
+def _glm5_precompile_kernels_after_loading(self):
+    import os as _os
+    if _os.environ.get("SGLANG_TILELANG_MOE", "0") != "1":
+        return
+    try:
+        from sglang.srt.layers.moe.tilelang_nvfp4.sglang_runner import (
+            precompile_tilelang_moe,
+        )
+        ok = precompile_tilelang_moe(self)
+        logger.info("[tlmoe] kernel precompile: %s", "done" if ok else "no MoE layer found")
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("[tlmoe] kernel precompile failed: %r", exc)
+
+
+Glm5NextForConditionalGeneration.precompile_kernels_after_loading = (
+    _glm5_precompile_kernels_after_loading
+)

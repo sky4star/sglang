@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import os
 import time
+import types
 import torch
 
 from .k1k3_emaj import w13_swiglu_emaj_dyn, w2_emaj_dyn
@@ -31,6 +32,13 @@ ENABLED = os.environ.get("SGLANG_TILELANG_MOE", "0") == "1"
 MIN_M = int(os.environ.get("SGLANG_TILELANG_MOE_MIN_M", "512"))
 BLOCK_K = 128
 BN = 128
+# Bucket the per-layer routing capacity so every layer allocates IDENTICAL
+# buffer shapes. Without bucketing each layer's cap differs -> the caching
+# allocator maps fresh physical segments every layer; on GB10 unified memory
+# (~100GB pinned by weights) that VMM churn triggers reclaim storms and can
+# hang the host (2026-10-04 x2 incidents, traced to pack_scale_words region).
+BUCKET = int(os.environ.get("SGLANG_TILELANG_MOE_BUCKET", "128"))
+MAX_CAP = int(os.environ.get("SGLANG_TILELANG_MOE_MAX_CAP", "4096"))
 
 
 class CapacityOverflow(Exception):
@@ -39,6 +47,43 @@ class CapacityOverflow(Exception):
     pass
 
 _states: dict[int, dict] = {}
+
+# Persistent device buffer pool: the run-time path performs ZERO torch
+# allocations. Fresh VMM segment mappings under GB10 unified-memory pressure
+# (weights pin ~100GB of 121GB) trigger kernel reclaim storms that hang the
+# host (2026-10-04 incidents 1-3, all traced to allocation sites around
+# pack_scale_words). Buffers are lazily grown and pre-warmed at MAX_CAP by
+# precompile_tilelang_moe so serving never grows them.
+_POOL: dict[str, torch.Tensor] = {}
+
+
+def _pbuf(key: str, numel: int, dtype, dev):
+    t = _POOL.get(key)
+    if t is None or t.numel() < numel:
+        t = torch.empty(numel, dtype=dtype, device=dev)
+        _POOL[key] = t
+    return t
+
+
+def _warm_pool(E: int, N: int, K: int, rows_max: int, dev):
+    # +BM rows on K1/K3 input/output buffers: the emaj kernels clamp their
+    # tile base to rows-BM, which (a) leaves the last dense rows unwritten and
+    # (b) clobbers valid rows near the tail. With rows+BM padding the clamp
+    # never fires for tiles that own real rows, so writes are exact.
+    maxc = MAX_CAP
+    BM = 128
+    for key, numel, dt in (
+        ("A1", (rows_max + BM) * (K // 2), torch.uint8),
+        ("act", (rows_max + BM) * N, torch.bfloat16),
+        ("A2", (rows_max + BM) * (N // 2), torch.uint8),
+        ("out2", (rows_max + BM) * K, torch.bfloat16),
+        ("y", rows_max * K, torch.float32),
+        ("SFA1sem", E * maxc * (K // 16), torch.float8_e4m3fn),
+        ("SFA1sw", E * maxc * (K // 64), torch.uint32),
+        ("SFA2sem", E * maxc * (N // 16), torch.float8_e4m3fn),
+        ("SFA2sw", E * maxc * (N // 64), torch.uint32),
+    ):
+        _pbuf(key, numel, dt, dev)
 
 
 def _unswizzle_blockscale(sw: torch.Tensor) -> torch.Tensor:
@@ -117,17 +162,29 @@ def should_run(x) -> bool:
 
 
 def run_tilelang_moe(*, x, topk_weights, topk_ids, quant_info, output):
+    trace = os.environ.get("SGLANG_TILELANG_MOE_TRACE", "0") == "1"
+    debug = os.environ.get("SGLANG_TILELANG_MOE_DEBUG", "0") == "1"
+
+    def _tick(tag, t0):
+        if trace:
+            torch.cuda.synchronize()
+            print(f"[tlmoe-trace] {tag} +{time.perf_counter()-t0:.3f}s", flush=True)
+        return time.perf_counter()
+
     st = _states.get(id(quant_info.w13_weight))
     if st is None:
-        if os.environ.get("SGLANG_TILELANG_MOE_DEBUG", "0") == "1":
+        if debug:
             print("[tlmoe] layer prep (weight conversion)", flush=True)
         st = _prepare_layer(quant_info)
+        st["lid"] = len(_states)
         _states[id(quant_info.w13_weight)] = st
 
     E, N, K = st["E"], st["N"], st["K"]
     ep_rank = st["ep_rank"]
     M, topk = topk_ids.shape
     dev = x.device
+    if trace:
+        print(f"[tlmoe-trace] L{st['lid']} begin M={M}", flush=True)
 
     ids = topk_ids.to(torch.int64)
     local_mask = (ids >= ep_rank * E) & (ids < (ep_rank + 1) * E)
@@ -142,7 +199,10 @@ def run_tilelang_moe(*, x, topk_weights, topk_ids, quant_info, output):
 
     counts = torch.bincount(expert_sorted, minlength=E)
     max_size = int(counts.max().item()) if E else 0
-    cap = max(128, ((max_size + 127) // 128) * 128)   # adaptive (symbolic in-kernel)
+    cap = max(BUCKET, ((max_size + BUCKET - 1) // BUCKET) * BUCKET)   # bucketed (symbolic in-kernel)
+    if cap > MAX_CAP:
+        raise CapacityOverflow(
+            f"routing max_size={max_size} -> cap={cap} exceeds MAX_CAP={MAX_CAP}")
     bpe = cap // 128
     rows_real = rows = int(kept_pairs.numel())
     offsets = torch.zeros(E + 1, dtype=torch.int32, device=dev)
@@ -154,39 +214,75 @@ def run_tilelang_moe(*, x, topk_weights, topk_ids, quant_info, output):
     padded = (expert_sorted * cap + within).to(torch.int32).contiguous()
 
     t_stage = time.perf_counter()
-    if os.environ.get("SGLANG_TILELANG_MOE_DEBUG", "0") == "1":
+    if trace:
+        torch.cuda.synchronize()
+        print(f"[tlmoe-trace] L{st['lid']} routed rows={rows} cap={cap} bpe={bpe} "
+              f"+{time.perf_counter()-t_stage:.3f}s", flush=True)
+        t_stage = time.perf_counter()
+    if debug:
         print(f"[tlmoe] K0 rows={rows} M={M} cap={cap} bpe={bpe}", flush=True)
+
+    # ---- pooled, zero-allocation buffers (slices only from here on) ----
+    Rcap = E * cap
+    BM = 128
+    rows_pad = rows + BM
+    A1_buf = _pbuf("A1", rows_pad * (K // 2), torch.uint8, dev)
+    A1 = A1_buf[: rows_pad * (K // 2)].view(rows_pad, K // 2)
+    SFA1sem = _pbuf("SFA1sem", Rcap * (K // 16), torch.float8_e4m3fn,
+                    dev)[: Rcap * (K // 16)].view(Rcap, K // 16)
+    SFA1sem.zero_()
+
     # K0: gather + quant (shape-generic kernel, compiled once)
-    A1 = torch.zeros(rows, K // 2, dtype=torch.uint8, device=dev)
-    SFA1sem = torch.zeros(E * cap, K // 16, dtype=torch.float8_e4m3fn, device=dev)
-    gather_quant_dyn(K, E)(x, src_rows, padded, A1, SFA1sem)
-    SFA1 = swizzle_chunk_kmajor(pack_scale_words(SFA1sem.view(torch.uint8))).reshape(-1, BLOCK_K // 64)
+    if trace:
+        print(f"[tlmoe-trace] L{st['lid']} K0 launching", flush=True)
+    gather_quant_dyn(K, E)(x, src_rows, padded, A1_buf[: rows * (K // 2)].view(rows, K // 2), SFA1sem)
+    t_stage = _tick(f"L{st['lid']} K0 done", t_stage)
+    # pack+swizzle, allocation-free: little-endian uint32 view == the old
+    # byte-wise pack_scale_words elementwise chain; strided copy_ == swizzle
+    W1 = K // 64
+    packed = SFA1sem.view(torch.uint8).view(Rcap, W1, 4).view(torch.uint32)
+    sw1 = _pbuf("SFA1sw", Rcap * W1, torch.uint32, dev)[: Rcap * W1].view(Rcap, W1)
+    sw1.view(Rcap // 128, W1, 32, 4).copy_(packed.view(Rcap // 128, 4, 32, W1).permute(0, 3, 2, 1))
+    SFA1 = sw1.view(-1, BLOCK_K // 64)
+    t_stage = _tick(f"L{st['lid']} K0 pack done", t_stage)
 
-    if os.environ.get("SGLANG_TILELANG_MOE_DEBUG", "0") == "1":
-        print(f"[tlmoe] K0 done {time.perf_counter()-t_stage:.3f}s", flush=True); t_stage = time.perf_counter()
     # K1
-    act = torch.zeros(rows, N, dtype=torch.bfloat16, device=dev)
+    act_buf = _pbuf("act", rows_pad * N, torch.bfloat16, dev)
+    act = act_buf[: rows_pad * N].view(rows_pad, N)
     k1 = w13_swiglu_emaj_dyn(E, N, K, block_K=BLOCK_K, lim=10.0)
+    if trace:
+        print(f"[tlmoe-trace] L{st['lid']} K1 launching", flush=True)
     k1(A1, st["Bg"], st["Bu"], SFA1, st["sfbg"], st["sfbu"], offsets, st["scale1"], act)
+    t_stage = _tick(f"L{st['lid']} K1 done", t_stage)
 
-    if os.environ.get("SGLANG_TILELANG_MOE_DEBUG", "0") == "1":
-        print(f"[tlmoe] K1 done {time.perf_counter()-t_stage:.3f}s", flush=True); t_stage = time.perf_counter()
     # K2
-    A2 = torch.zeros(rows, N // 2, dtype=torch.uint8, device=dev)
-    SFA2sem = torch.zeros(E * cap, N // 16, dtype=torch.float8_e4m3fn, device=dev)
+    A2_buf = _pbuf("A2", rows_pad * (N // 2), torch.uint8, dev)
+    SFA2sem = _pbuf("SFA2sem", Rcap * (N // 16), torch.float8_e4m3fn,
+                    dev)[: Rcap * (N // 16)].view(Rcap, N // 16)
+    SFA2sem.zero_()
     src_identity = torch.arange(rows, dtype=torch.int32, device=dev)
-    gather_quant_dyn(N, E)(act, src_identity, padded, A2, SFA2sem)
-    SFA2 = swizzle_chunk_kmajor(pack_scale_words(SFA2sem.view(torch.uint8))).reshape(-1, BLOCK_K // 64)
+    if trace:
+        print(f"[tlmoe-trace] L{st['lid']} K2 launching", flush=True)
+    gather_quant_dyn(N, E)(act_buf[: rows * N].view(rows, N), src_identity, padded,
+                           A2_buf[: rows * (N // 2)].view(rows, N // 2), SFA2sem)
+    t_stage = _tick(f"L{st['lid']} K2 done", t_stage)
+    W2 = N // 64
+    packed2 = SFA2sem.view(torch.uint8).view(Rcap, W2, 4).view(torch.uint32)
+    sw2 = _pbuf("SFA2sw", Rcap * W2, torch.uint32, dev)[: Rcap * W2].view(Rcap, W2)
+    sw2.view(Rcap // 128, W2, 32, 4).copy_(packed2.view(Rcap // 128, 4, 32, W2).permute(0, 3, 2, 1))
+    SFA2 = sw2.view(-1, BLOCK_K // 64)
+    t_stage = _tick(f"L{st['lid']} K2 pack done", t_stage)
 
-    if os.environ.get("SGLANG_TILELANG_MOE_DEBUG", "0") == "1":
-        print(f"[tlmoe] K2 done {time.perf_counter()-t_stage:.3f}s", flush=True); t_stage = time.perf_counter()
     # K3
-    out2 = torch.zeros(rows, K, dtype=torch.bfloat16, device=dev)
+    out2_buf = _pbuf("out2", rows_pad * K, torch.bfloat16, dev)
+    out2 = out2_buf[: rows_pad * K].view(rows_pad, K)
+    A2 = A2_buf[: rows_pad * (N // 2)].view(rows_pad, N // 2)
     k3 = w2_emaj_dyn(E, K, N, block_N=BLOCK_K)
+    if trace:
+        print(f"[tlmoe-trace] L{st['lid']} K3 launching", flush=True)
     k3(A2, st["W2"], SFA2, st["sfb2"], offsets, out2)
+    t_stage = _tick(f"L{st['lid']} K3 done", t_stage)
 
-    if os.environ.get("SGLANG_TILELANG_MOE_DEBUG", "0") == "1":
-        print(f"[tlmoe] K3 done {time.perf_counter()-t_stage:.3f}s", flush=True); t_stage = time.perf_counter()
     # combine: slot -> DENSE gathered row (expert-ordered out2 position)
     slot_rows = torch.zeros(M, topk, dtype=torch.int32, device=dev)
     slot_scale = torch.zeros(M, topk, dtype=torch.float32, device=dev)
@@ -194,9 +290,75 @@ def run_tilelang_moe(*, x, topk_weights, topk_ids, quant_info, output):
     slot_rows.reshape(-1)[sorted_pairs] = dense_rows
     slot_scale.reshape(-1)[sorted_pairs] = (
         st["scale2"][expert_sorted] * topk_weights.reshape(-1).float()[sorted_pairs])
-    y = torch.empty(M, K, dtype=torch.float32, device=dev)
-    moe_combine_dyn(K, topk)(out2, slot_rows.contiguous(), slot_scale.contiguous(), y)
-    if os.environ.get("SGLANG_TILELANG_MOE_DEBUG", "0") == "1":
+    y = _pbuf("y", M * K, torch.float32, dev)[: M * K].view(M, K)
+    if trace:
+        print(f"[tlmoe-trace] L{st['lid']} combine launching", flush=True)
+    moe_combine_dyn(K, topk)(out2_buf[: rows * K].view(rows, K),
+                             slot_rows.contiguous(), slot_scale.contiguous(), y)
+    t_stage = _tick(f"L{st['lid']} combine done", t_stage)
+    if debug:
         print(f"[tlmoe] combine done {time.perf_counter()-t_stage:.3f}s", flush=True)
-    output.copy_(y.to(output.dtype))
+    output.copy_(y)
+    t_stage = _tick(f"L{st['lid']} copy out done", t_stage)
     return output
+
+
+def precompile_tilelang_moe(model, num_tokens: int = 8192) -> bool:
+    """AOT-compile the 5 TileLang MoE kernels during engine init.
+
+    Called from the model's `precompile_kernels_after_loading` hook (runs on
+    every TP rank after weight load, before serving — symmetric across ranks,
+    outside the serving watchdog). Kernels are shape-generic (symbolic rows),
+    so one compile per kernel covers every future batch shape.
+    """
+    import torch.nn as nn
+
+    layer = None
+    for m in model.modules():
+        if (
+            hasattr(m, "w13_weight")
+            and hasattr(m, "w2_weight")
+            and getattr(m, "w13_blockscale_swizzled", None) is not None
+            and getattr(m, "w13_weight", None) is not None
+        ):
+            layer = m
+            break
+    if layer is None:
+        return False
+    E, twoN, Kh = layer.w13_weight.shape
+    N, K = twoN // 2, Kh * 2
+    topk = int(getattr(layer, "topk", 8))
+    quant_scales = [
+        layer.w13_input_scale_quant,
+        layer.w13_blockscale_swizzled,
+        layer.g1_alphas,
+        layer.w2_input_scale_quant,
+        layer.w2_blockscale_swizzled,
+        layer.g2_alphas,
+    ]
+    if any(q is None for q in quant_scales):
+        return False
+    quant_info = types.SimpleNamespace(
+        w13_weight=layer.w13_weight,
+        w2_weight=layer.w2_weight,
+        quant_type="fp4",
+        quant_scales=quant_scales,
+        moe_ep_rank=int(layer.moe_ep_rank),
+        moe_ep_size=int(layer.moe_ep_size),
+        moe_tp_rank=int(layer.moe_tp_rank),
+        moe_tp_size=int(layer.moe_tp_size),
+    )
+    dev = layer.w13_weight.device
+    # Pre-warm the buffer pool at MAX_CAP so the serving path never allocates.
+    _warm_pool(E, N, K, rows_max=num_tokens * topk, dev=dev)
+    g = torch.Generator(device=dev).manual_seed(0)
+    X = torch.randn(num_tokens, K, device=dev, dtype=torch.bfloat16, generator=g) / 10
+    score = torch.randn(num_tokens, E, device=dev, dtype=torch.bfloat16, generator=g)
+    tw, ti = torch.topk(score, topk, dim=-1, sorted=False)
+    tw = torch.softmax(tw.float(), dim=-1)
+    out = torch.empty(num_tokens, K, device=dev, dtype=torch.bfloat16)
+    with torch.inference_mode():
+        run_tilelang_moe(x=X, topk_weights=tw, topk_ids=ti.to(torch.int),
+                         quant_info=quant_info, output=out)
+    torch.cuda.synchronize()
+    return True
