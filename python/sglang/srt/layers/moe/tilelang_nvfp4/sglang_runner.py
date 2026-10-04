@@ -19,18 +19,24 @@ to SGLANG_TILELANG_MOE_BUCKET (512) so TileLang compiles once per bucket.
 from __future__ import annotations
 
 import os
+import time
 import torch
 
-from .k1k3_emaj import w13_swiglu_emaj, w2_emaj
-from .moe_combine_kernel import moe_combine
-from .act_quant_kernel import gather_quant
+from .k1k3_emaj import w13_swiglu_emaj_dyn, w2_emaj_dyn
+from .moe_combine_kernel import moe_combine_dyn
+from .act_quant_kernel import gather_quant_dyn
 from .grouped_nvfp4_gemm import pack_scale_words, swizzle_chunk_kmajor
 
 ENABLED = os.environ.get("SGLANG_TILELANG_MOE", "0") == "1"
 MIN_M = int(os.environ.get("SGLANG_TILELANG_MOE_MIN_M", "512"))
-BUCKET = int(os.environ.get("SGLANG_TILELANG_MOE_BUCKET", "512"))
 BLOCK_K = 128
 BN = 128
+
+
+class CapacityOverflow(Exception):
+    """A routing batch exceeded the pinned per-expert capacity; the caller
+    should fall back to the production path for this batch."""
+    pass
 
 _states: dict[int, dict] = {}
 
@@ -113,6 +119,8 @@ def should_run(x) -> bool:
 def run_tilelang_moe(*, x, topk_weights, topk_ids, quant_info, output):
     st = _states.get(id(quant_info.w13_weight))
     if st is None:
+        if os.environ.get("SGLANG_TILELANG_MOE_DEBUG", "0") == "1":
+            print("[tlmoe] layer prep (weight conversion)", flush=True)
         st = _prepare_layer(quant_info)
         _states[id(quant_info.w13_weight)] = st
 
@@ -133,51 +141,52 @@ def run_tilelang_moe(*, x, topk_weights, topk_ids, quant_info, output):
     expert_sorted = expert_of_kept[sort_idx]
 
     counts = torch.bincount(expert_sorted, minlength=E)
-    sizes = counts.cpu().tolist()
-    max_size = max(sizes) if sizes else 0
-    cap = max(128, ((max_size + 127) // 128) * 128)
+    max_size = int(counts.max().item()) if E else 0
+    cap = max(128, ((max_size + 127) // 128) * 128)   # adaptive (symbolic in-kernel)
     bpe = cap // 128
-    rows_real = int(kept_pairs.numel())
-    rows = max(BUCKET, ((rows_real + BUCKET - 1) // BUCKET) * BUCKET)
+    rows_real = rows = int(kept_pairs.numel())
     offsets = torch.zeros(E + 1, dtype=torch.int32, device=dev)
     offsets[1:] = torch.cumsum(counts, 0).to(torch.int32)
 
     token_of_pair = torch.arange(M, device=dev).unsqueeze(1).expand(M, topk).reshape(-1)
-    src_rows = token_of_pair[sorted_pairs].to(torch.int32)
-    within = torch.arange(rows_real, device=dev) - offsets[expert_sorted].long()
-    padded = (expert_sorted * cap + within).to(torch.int32)
-    # pad to the bucketed `rows` so tensor shapes match the compiled ABI; the
-    # extra slots read token 0 and write an unused SF slot (harmless)
-    pad_n = rows - rows_real
-    if pad_n > 0:
-        src_rows = torch.cat([src_rows, torch.zeros(pad_n, dtype=torch.int32, device=dev)])
-        padded = torch.cat([padded, torch.full((pad_n,), E * cap - 1, dtype=torch.int32, device=dev)])
-    src_rows = src_rows.contiguous()
-    padded = padded.contiguous()
+    src_rows = token_of_pair[sorted_pairs].to(torch.int32).contiguous()
+    within = torch.arange(rows, device=dev) - offsets[expert_sorted].long()
+    padded = (expert_sorted * cap + within).to(torch.int32).contiguous()
 
-    # K0: gather + quant
+    t_stage = time.perf_counter()
+    if os.environ.get("SGLANG_TILELANG_MOE_DEBUG", "0") == "1":
+        print(f"[tlmoe] K0 rows={rows} M={M} cap={cap} bpe={bpe}", flush=True)
+    # K0: gather + quant (shape-generic kernel, compiled once)
     A1 = torch.zeros(rows, K // 2, dtype=torch.uint8, device=dev)
     SFA1sem = torch.zeros(E * cap, K // 16, dtype=torch.float8_e4m3fn, device=dev)
-    gather_quant(rows, M, K, E, cap)(x, src_rows, padded, A1, SFA1sem)
+    gather_quant_dyn(K, E)(x, src_rows, padded, A1, SFA1sem)
     SFA1 = swizzle_chunk_kmajor(pack_scale_words(SFA1sem.view(torch.uint8))).reshape(-1, BLOCK_K // 64)
 
+    if os.environ.get("SGLANG_TILELANG_MOE_DEBUG", "0") == "1":
+        print(f"[tlmoe] K0 done {time.perf_counter()-t_stage:.3f}s", flush=True); t_stage = time.perf_counter()
     # K1
     act = torch.zeros(rows, N, dtype=torch.bfloat16, device=dev)
-    k1 = w13_swiglu_emaj(E, N, K, rows, bpe, block_K=BLOCK_K, lim=10.0)
+    k1 = w13_swiglu_emaj_dyn(E, N, K, block_K=BLOCK_K, lim=10.0)
     k1(A1, st["Bg"], st["Bu"], SFA1, st["sfbg"], st["sfbu"], offsets, st["scale1"], act)
 
+    if os.environ.get("SGLANG_TILELANG_MOE_DEBUG", "0") == "1":
+        print(f"[tlmoe] K1 done {time.perf_counter()-t_stage:.3f}s", flush=True); t_stage = time.perf_counter()
     # K2
     A2 = torch.zeros(rows, N // 2, dtype=torch.uint8, device=dev)
     SFA2sem = torch.zeros(E * cap, N // 16, dtype=torch.float8_e4m3fn, device=dev)
     src_identity = torch.arange(rows, dtype=torch.int32, device=dev)
-    gather_quant(rows, rows, N, E, cap)(act, src_identity, padded, A2, SFA2sem)
+    gather_quant_dyn(N, E)(act, src_identity, padded, A2, SFA2sem)
     SFA2 = swizzle_chunk_kmajor(pack_scale_words(SFA2sem.view(torch.uint8))).reshape(-1, BLOCK_K // 64)
 
+    if os.environ.get("SGLANG_TILELANG_MOE_DEBUG", "0") == "1":
+        print(f"[tlmoe] K2 done {time.perf_counter()-t_stage:.3f}s", flush=True); t_stage = time.perf_counter()
     # K3
     out2 = torch.zeros(rows, K, dtype=torch.bfloat16, device=dev)
-    k3 = w2_emaj(E, K, N, rows, bpe, block_N=BLOCK_K)
+    k3 = w2_emaj_dyn(E, K, N, block_N=BLOCK_K)
     k3(A2, st["W2"], SFA2, st["sfb2"], offsets, out2)
 
+    if os.environ.get("SGLANG_TILELANG_MOE_DEBUG", "0") == "1":
+        print(f"[tlmoe] K3 done {time.perf_counter()-t_stage:.3f}s", flush=True); t_stage = time.perf_counter()
     # combine: slot -> DENSE gathered row (expert-ordered out2 position)
     slot_rows = torch.zeros(M, topk, dtype=torch.int32, device=dev)
     slot_scale = torch.zeros(M, topk, dtype=torch.float32, device=dev)
@@ -186,6 +195,8 @@ def run_tilelang_moe(*, x, topk_weights, topk_ids, quant_info, output):
     slot_scale.reshape(-1)[sorted_pairs] = (
         st["scale2"][expert_sorted] * topk_weights.reshape(-1).float()[sorted_pairs])
     y = torch.empty(M, K, dtype=torch.float32, device=dev)
-    moe_combine(M, rows, K, topk)(out2, slot_rows.contiguous(), slot_scale.contiguous(), y)
+    moe_combine_dyn(K, topk)(out2, slot_rows.contiguous(), slot_scale.contiguous(), y)
+    if os.environ.get("SGLANG_TILELANG_MOE_DEBUG", "0") == "1":
+        print(f"[tlmoe] combine done {time.perf_counter()-t_stage:.3f}s", flush=True)
     output.copy_(y.to(output.dtype))
     return output

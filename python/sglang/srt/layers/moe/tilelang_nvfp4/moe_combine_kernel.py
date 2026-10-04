@@ -70,3 +70,37 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+@tilelang.jit(pass_configs={"tl.disable_warp_specialized": True})
+def moe_combine_dyn(
+    K: int,
+    topk: int,
+    block_M: int = 64,
+    block_K: int = 256,
+    threads: int = 128,
+    out_dtype=T.float32,
+):
+    """Shape-generic variant: M / rows symbolic (bound at call time)."""
+    M = T.dynamic("M")
+    rows = T.dynamic("rows")
+
+    @T.prim_func
+    def main(
+        out2: T.Tensor((rows, K), T.bfloat16),
+        slot_rows: T.Tensor((M, topk), T.int32),
+        slot_scale: T.Tensor((M, topk), T.float32),
+        y: T.Tensor((M, K), out_dtype),
+    ):
+        with T.Kernel(T.ceildiv(K, block_K), T.ceildiv(M, block_M), threads=threads) as (bk, bm):
+            acc = T.alloc_fragment((block_M, block_K), T.float32)
+            T.clear(acc)
+            for s in T.serial(topk):
+                for i, j in T.Parallel(block_M, block_K):
+                    t = bm * block_M + i
+                    acc[i, j] += T.Cast("float32", out2[slot_rows[t, s], bk * block_K + j]) * slot_scale[t, s]
+            for i, j in T.Parallel(block_M, block_K):
+                if bm * block_M + i < M:
+                    y[bm * block_M + i, bk * block_K + j] = T.Cast(out_dtype, acc[i, j])
+
+    return main

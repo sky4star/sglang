@@ -304,10 +304,15 @@ def _run_flashinfer_cutlass(
                 quant_info=quant_info,
                 output=output,
             )
-        except Exception:
-            if os.environ.get("SGLANG_TILELANG_MOE_STRICT", "0") == "1":
+        except Exception as exc:
+            from sglang.srt.layers.moe.tilelang_nvfp4.sglang_runner import CapacityOverflow
+
+            if isinstance(exc, CapacityOverflow) or os.environ.get("SGLANG_TILELANG_MOE_STRICT", "0") != "1":
+                # expected-condition fallback (routing skew) or lenient mode:
+                # fall through to the production path for this batch
+                pass
+            else:
                 raise
-            # fall through to the production path on any TileLang failure
 
     w13_weight = quant_info.w13_weight
     w2_weight = quant_info.w2_weight
