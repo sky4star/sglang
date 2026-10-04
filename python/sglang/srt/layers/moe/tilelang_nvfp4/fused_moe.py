@@ -15,6 +15,7 @@ scale, so the GEMM outputs are divided by the per-expert weight global scale.
 """
 import argparse
 import math
+import os
 from pathlib import Path
 import sys
 
@@ -29,6 +30,7 @@ try:
     )
     from .w13_swiglu_kernel import w13_swiglu
     from .w2_gemm_kernel import w2_gemm
+    from .k1k3_emaj import w13_swiglu_emaj, w2_emaj
     from .moe_combine_kernel import moe_combine
     from .act_quant_kernel import gather_quant
 except ImportError:
@@ -37,6 +39,7 @@ except ImportError:
     )
     from w13_swiglu_kernel import w13_swiglu
     from w2_gemm_kernel import w2_gemm
+    from k1k3_emaj import w13_swiglu_emaj, w2_emaj
     from moe_combine_kernel import moe_combine
     from act_quant_kernel import gather_quant
 
@@ -64,6 +67,11 @@ def main():
     ap.add_argument("--N", type=int, default=2048)
     ap.add_argument("--topk", type=int, default=8)
     ap.add_argument("--lim", type=float, default=10.0)
+    ap.add_argument("--emaj", dest="emaj", action="store_true",
+                    default=os.environ.get("TILELANG_MOE_EMAJ", "1") == "1",
+                    help="use expert-major rasterized K1/K3 grouped GEMMs "
+                         "(default on; bit-exact, ~1.19x/1.31x vs baseline)")
+    ap.add_argument("--no-emaj", dest="emaj", action="store_false")
     ap.add_argument("--no-verify", action="store_true")
     args = ap.parse_args()
     dev = "cuda"
@@ -119,7 +127,8 @@ def main():
     # ---- K1 ----
     scale1 = 1.0 / wg_gs  # no activation global scale
     act = torch.empty(rows, N, device=dev, dtype=torch.bfloat16)
-    k1 = w13_swiglu(E, N, K, rows, bpe, block_K=BLOCK_K, lim=args.lim)
+    k1 = (w13_swiglu_emaj(E, N, K, rows, bpe, block_K=BLOCK_K, lim=args.lim)
+          if args.emaj else w13_swiglu(E, N, K, rows, bpe, block_K=BLOCK_K, lim=args.lim))
     k1(A1, wg_q, wu_q, SFA1, SFBg, SFBu, offsets, scale1, act)
     torch.cuda.synchronize()
 
@@ -132,7 +141,8 @@ def main():
 
     # ---- K3: w2 GEMM (expert-ordered output) ----
     out2 = torch.empty(rows, K, device=dev, dtype=torch.bfloat16)
-    k3 = w2_gemm(E, K, N, rows, bpe, block_N=BLOCK_K)
+    k3 = (w2_emaj(E, K, N, rows, bpe, block_N=BLOCK_K)
+          if args.emaj else w2_gemm(E, K, N, rows, bpe, block_N=BLOCK_K))
     k3(A2, w2_q, SFA2, SFB2, offsets, out2)
 
     # ---- combine: gather-reduction over topk ----

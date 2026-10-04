@@ -23,6 +23,22 @@ Five kernels (vs ~5 in the CUDA baseline, but with different fusion):
 `fused_moe.py` wires the pipeline and validates against a dequant-operand oracle.
 `grouped_nvfp4_gemm.py` holds the base grouped GEMM and the scale-layout helpers.
 
+### Expert-major rasterization (`k1k3_emaj.py`)
+
+`w13_swiglu_emaj` / `w2_emaj` are the K1/K3 grouped GEMMs with the CTA raster
+order changed from `(bn, bm)` to `(local, bn, e)`: consecutive CTAs share the
+same (expert, n-tile) B tile across the expert's M-tiles, so the B tile is
+streamed from DRAM once and the sibling M-tile CTAs hit L2. Bit-exact vs the
+bn-major kernels; w13 reaches 217 GB/s (~90% of the GB10 streaming roof).
+
+| M (chunk) | flashinfer cutlass_fused_moe | this package (`--no-emaj`) | this package (`--emaj`) |
+|---:|---:|---:|---:|
+| 4096 | 17.73 ms | 15.56 ms | **14.88 ms (1.19x)** |
+| 8192 | 28.34 ms | 23.90 ms | **21.70 ms (1.31x)** |
+
+On by default (`TILELANG_MOE_EMAJ=1`); pass `--no-emaj` for the bn-major
+schedule (A/B).
+
 The combine is a **gather-reduction, not an atomic scatter**: each token's
 `topk` rows are gathered and summed (no contention), which hits the memory
 floor. A fused atomic-scatter variant measured ~2 ms slower and is not included.
