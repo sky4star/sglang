@@ -55,8 +55,9 @@ def w13_swiglu_emaj(E, N, K, rows, bpe, block_K=128, num_stages=2, threads=256,
             Cu = T.alloc_fragment((BM, BN), T.float32)
 
             bm = e * bpe + local
-            m_start = offsets[e] + local * BM
-            actual = T.max(0, T.min(BM, offsets[e + 1] - m_start))
+            m_start_raw = offsets[e] + local * BM
+            m_start = T.min(T.max(m_start_raw, 0), rows - BM)
+            actual = T.max(0, T.min(BM, offsets[e + 1] - m_start_raw))
             sc = scale[e]
 
             T.clear(Cg)
@@ -119,8 +120,9 @@ def w2_emaj(E, K, N, rows, bpe, block_N=128, threads=128, num_stages=2,
             C = T.alloc_fragment((BM, BN), T.float32)
 
             bm = e * bpe + local
-            m_start = offsets[e] + local * BM
-            actual = T.max(0, T.min(BM, offsets[e + 1] - m_start))
+            m_start_raw = offsets[e] + local * BM
+            m_start = T.min(T.max(m_start_raw, 0), rows - BM)
+            actual = T.max(0, T.min(BM, offsets[e + 1] - m_start_raw))
 
             T.clear(C)
             for ko in T.Pipelined(k_blocks, num_stages=num_stages):
