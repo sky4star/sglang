@@ -117,3 +117,53 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+@tilelang.jit(pass_configs={"tl.disable_warp_specialized": True})
+def gather_quant_dyn(
+    Cols: int,
+    E: int,
+    blk_m: int = 128,
+    block_N: int = 128,
+    threads: int = 128,
+):
+    """Shape-generic variant: rows / S / cap are symbolic (bound at call time
+    from the tensor shapes). One compile serves every batch shape."""
+    assert Cols % block_N == 0 and block_N % 16 == 0
+    G = block_N // 16
+    in_dtype = T.bfloat16
+    e4 = T.float8_e4m3
+    e2 = T.float4_e2m1fn
+    rows = T.dynamic("rows")
+    S = T.dynamic("S")
+    cap = T.dynamic("cap")
+
+    @T.prim_func
+    def main(
+        X: T.Tensor((S, Cols), in_dtype),
+        src_row: T.Tensor((rows,), T.int32),
+        padded_row: T.Tensor((rows,), T.int32),
+        Aq: T.Tensor((rows, Cols), e2),
+        SFA: T.Tensor((E * cap, Cols // 16), e4),
+    ):
+        with T.Kernel(T.ceildiv(rows, blk_m), Cols // block_N, threads=threads) as (bm, bk):
+            x_sh = T.alloc_shared((blk_m, G, 16), in_dtype)
+            x_loc = T.alloc_fragment((blk_m, G, 16), in_dtype)
+            amax = T.alloc_fragment((blk_m, G), T.float32)
+            s_loc = T.alloc_fragment((blk_m, G), T.float32)
+            y_sh = T.alloc_shared((blk_m, block_N), e2)
+
+            for i, g, tt in T.Parallel(blk_m, G, 16):
+                x_sh[i, g, tt] = X[src_row[bm * blk_m + i], bk * block_N + g * 16 + tt]
+            T.copy(x_sh, x_loc)
+            T.reduce_absmax(x_loc, amax, dim=2)
+            for i, g in T.Parallel(blk_m, G):
+                amax[i, g] = T.max(amax[i, g], 1e-6)
+                s_loc[i, g] = T.Cast("float32", T.Cast(e4, amax[i, g] / 6.0))
+            for i, g, tt in T.Parallel(blk_m, G, 16):
+                y_sh[i, g * 16 + tt] = T.clamp(x_loc[i, g, tt] / s_loc[i, g], -6.0, 6.0)
+            for i, g in T.Parallel(blk_m, G):
+                SFA[padded_row[bm * blk_m + i], bk * G + g] = T.Cast(e4, amax[i, g] / 6.0)
+            T.copy(y_sh, Aq[bm * blk_m, bk * block_N])
+
+    return main
