@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
+import os
+
 import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
@@ -288,6 +290,32 @@ def _run_flashinfer_cutlass(
                 dtype=output_dtype,
                 device=x.device,
             )
+
+    if os.environ.get("SGLANG_TILELANG_MOE", "0") == "1" and x.shape[0] >= int(
+        os.environ.get("SGLANG_TILELANG_MOE_MIN_M", "512")
+    ):
+        try:
+            from sglang.srt.layers.moe.tilelang_nvfp4.sglang_runner import run_tilelang_moe
+
+            return run_tilelang_moe(
+                x=x,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                quant_info=quant_info,
+                output=output,
+            )
+        except Exception as exc:
+            from sglang.srt.layers.moe.tilelang_nvfp4.sglang_runner import CapacityOverflow
+
+            if isinstance(exc, CapacityOverflow) or os.environ.get("SGLANG_TILELANG_MOE_STRICT", "0") != "1":
+                # expected-condition fallback (routing skew) or lenient mode:
+                # fall through to the production path for this batch.
+                # 2026-10-06: log it — the silent fallback masked real traffic
+                # in A/B tests and delayed the freeze root-cause hunt.
+                print(f"[tlmoe] fallback to flashinfer_cutlass: {exc!r}", flush=True)
+                pass
+            else:
+                raise
 
     w13_weight = quant_info.w13_weight
     w2_weight = quant_info.w2_weight
