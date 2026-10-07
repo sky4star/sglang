@@ -127,8 +127,10 @@ def gather_quant_dyn(
     block_N: int = 128,
     threads: int = 128,
 ):
-    """Shape-generic variant: rows / S / cap are symbolic (bound at call time
-    from the tensor shapes). One compile serves every batch shape."""
+    """Shape-generic variant: rows / S / sfa_rows are symbolic (bound at call
+    time from the tensor shapes). One compile serves every batch shape.
+    2026-10-06 (tile-table): padded_row targets per-GEMM-tile SFA slabs
+    (tile_start[e]*128 + within), so the SFA row count is decoupled from E."""
     assert Cols % block_N == 0 and block_N % 16 == 0
     G = block_N // 16
     in_dtype = T.bfloat16
@@ -136,7 +138,7 @@ def gather_quant_dyn(
     e2 = T.float4_e2m1fn
     rows = T.dynamic("rows")
     S = T.dynamic("S")
-    cap = T.dynamic("cap")
+    sfa_rows = T.dynamic("sfa_rows")
 
     @T.prim_func
     def main(
@@ -144,7 +146,7 @@ def gather_quant_dyn(
         src_row: T.Tensor((rows,), T.int32),
         padded_row: T.Tensor((rows,), T.int32),
         Aq: T.Tensor((rows, Cols), e2),
-        SFA: T.Tensor((E * cap, Cols // 16), e4),
+        SFA: T.Tensor((sfa_rows, Cols // 16), e4),
     ):
         with T.Kernel(T.ceildiv(rows, blk_m), Cols // block_N, threads=threads) as (bm, bk):
             x_sh = T.alloc_shared((blk_m, G, 16), in_dtype)
