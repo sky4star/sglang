@@ -145,7 +145,7 @@ def w2_emaj(E, K, N, rows, bpe, block_N=128, threads=128, num_stages=2,
 
 @tilelang.jit(pass_configs={"tl.disable_warp_specialized": True})
 def w13_swiglu_emaj_dyn(E, N, K, block_K=128, num_stages=2, threads=256,
-                        lim=10.0, out_dtype=T.bfloat16):
+                        lim=10.0, out_dtype=T.bfloat16, sfb_native=True):
     """Shape-generic w13+SwiGLU (expert-major): `rows` and `bpe` (capacity
     blocks per expert) are symbolic — bound at call time; E/N/K stay
     compile-time. The grid adapts to routing skew per batch.
@@ -154,6 +154,9 @@ def w13_swiglu_emaj_dyn(E, N, K, block_K=128, num_stages=2, threads=256,
     this). With exact-rows buffers the m_start clamp fires on the last
     <BM-row expert: its tile misroutes to the clamp position and its real
     tail rows are left unwritten (latent artifact found 2026-10-06).
+
+    sfb_native: see w2_emaj_dyn_tbl (kept in lockstep to avoid divergence;
+    this split-weight variant reads SFBg/SFBu native views the same way).
     """
     assert N % 128 == 0 and K % block_K == 0 and block_K % 64 == 0
     k_blocks = K // block_K
@@ -163,6 +166,12 @@ def w13_swiglu_emaj_dyn(E, N, K, block_K=128, num_stages=2, threads=256,
     in_dtype = T.float4_e2m1fn
     rows = T.dynamic("rows")
     bpe = T.dynamic("bpe")
+    Rn_sf = 2 * n_blocks
+    Cn_sf = k_blocks * words
+    if sfb_native:
+        sfb_words = E * Rn_sf * Cn_sf * 128
+    else:
+        sfb_words = E * n_blocks * k_blocks * BN * words
 
     @T.prim_func
     def main(
@@ -170,8 +179,8 @@ def w13_swiglu_emaj_dyn(E, N, K, block_K=128, num_stages=2, threads=256,
         Bg: T.Tensor((E, N, K), in_dtype),
         Bu: T.Tensor((E, N, K), in_dtype),
         SFA: T.Tensor((E * bpe * BM * k_blocks, words), T.uint32),
-        SFBg: T.Tensor((E * n_blocks * k_blocks * BN, words), T.uint32),
-        SFBu: T.Tensor((E * n_blocks * k_blocks * BN, words), T.uint32),
+        SFBg: T.Tensor((sfb_words,), T.uint32),
+        SFBu: T.Tensor((sfb_words,), T.uint32),
         offsets: T.Tensor((E + 1,), T.int32),
         scale: T.Tensor((E,), T.float32),
         act: T.Tensor((rows, N), out_dtype),
@@ -201,9 +210,20 @@ def w13_swiglu_emaj_dyn(E, N, K, block_K=128, num_stages=2, threads=256,
                 for r, w in T.Parallel(BM, words):
                     SFA_s[r, w] = SFA[((e * bpe + local) * k_blocks + ko) * BM + r, w]
                 for r, w in T.Parallel(BN, words):
-                    SFBg_s[r, w] = SFBg[((e * n_blocks + bn) * k_blocks + ko) * BN + r, w]
-                for r, w in T.Parallel(BN, words):
-                    SFBu_s[r, w] = SFBu[((e * n_blocks + bn) * k_blocks + ko) * BN + r, w]
+                    if sfb_native:
+                        flat = words * r + w
+                        kb = flat // 128
+                        intra = flat % 128
+                        idx = 32 * (intra % 4) + intra // 4
+                        sfb_off = (((e * Rn_sf + bn) * Cn_sf + ko * words + kb) * 128
+                                   + (idx % 32) * 4 + idx // 32)
+                        SFBg_s[r, w] = SFBg[sfb_off]
+                        SFBu_s[r, w] = SFBu[sfb_off + n_blocks * Cn_sf * 128]
+                    else:
+                        SFBg_s[r, w] = SFBg[
+                            (((e * n_blocks + bn) * k_blocks + ko) * BN + r) * words + w]
+                        SFBu_s[r, w] = SFBu[
+                            (((e * n_blocks + bn) * k_blocks + ko) * BN + r) * words + w]
                 T.mma_gemm_blockscaled(A_s, Bg_s, Cg, SFA_s, SFBg_s, transpose_B=True,
                                        clear_accum=False, k_start=ko * block_K,
                                        sf_a_granularity_k=16, sf_b_granularity_k=16,
@@ -226,10 +246,11 @@ def w13_swiglu_emaj_dyn(E, N, K, block_K=128, num_stages=2, threads=256,
 
 @tilelang.jit(pass_configs={"tl.disable_warp_specialized": True})
 def w2_emaj_dyn(E, K, N, block_N=128, threads=128, num_stages=2,
-                out_dtype=T.bfloat16):
+                out_dtype=T.bfloat16, sfb_native=True):
     """Shape-generic grouped w2 (expert-major): `rows`/`bpe` symbolic.
 
     Same rows+BM padding contract as w13_swiglu_emaj_dyn.
+    sfb_native: see w2_emaj_dyn_tbl.
     """
     assert K % block_N == 0 and block_N % 64 == 0 and N % 128 == 0
     k_blocks = N // block_N
@@ -239,13 +260,19 @@ def w2_emaj_dyn(E, K, N, block_N=128, threads=128, num_stages=2,
     in_dtype = T.float4_e2m1fn
     rows = T.dynamic("rows")
     bpe = T.dynamic("bpe")
+    Rn_sf = n_blocks
+    Cn_sf = k_blocks * words
+    if sfb_native:
+        sfb_words = E * Rn_sf * Cn_sf * 128
+    else:
+        sfb_words = E * n_blocks * k_blocks * BN * words
 
     @T.prim_func
     def main(
         A: T.Tensor((rows, N), in_dtype),
         B: T.Tensor((E, K, N), in_dtype),
         SFA: T.Tensor((E * bpe * BM * k_blocks, words), T.uint32),
-        SFB: T.Tensor((E * n_blocks * k_blocks * BN, words), T.uint32),
+        SFB: T.Tensor((sfb_words,), T.uint32),
         offsets: T.Tensor((E + 1,), T.int32),
         out2: T.Tensor((rows, K), out_dtype),
     ):
@@ -268,7 +295,17 @@ def w2_emaj_dyn(E, K, N, block_N=128, threads=128, num_stages=2,
                 for r, w in T.Parallel(BM, words):
                     SFA_s[r, w] = SFA[((e * bpe + local) * k_blocks + ko) * BM + r, w]
                 for r, w in T.Parallel(BN, words):
-                    SFB_s[r, w] = SFB[((e * n_blocks + bn) * k_blocks + ko) * BN + r, w]
+                    if sfb_native:
+                        flat = words * r + w
+                        kb = flat // 128
+                        intra = flat % 128
+                        idx = 32 * (intra % 4) + intra // 4
+                        SFB_s[r, w] = SFB[
+                            ((e * Rn_sf + bn) * Cn_sf + ko * words + kb) * 128
+                            + (idx % 32) * 4 + idx // 32]
+                    else:
+                        SFB_s[r, w] = SFB[
+                            (((e * n_blocks + bn) * k_blocks + ko) * BN + r) * words + w]
                 T.mma_gemm_blockscaled(A_s, B_s, C, SFA_s, SFB_s, transpose_B=True,
                                        clear_accum=False, k_start=ko * block_N,
                                        sf_a_granularity_k=16, sf_b_granularity_k=16,
@@ -282,7 +319,7 @@ def w2_emaj_dyn(E, K, N, block_N=128, threads=128, num_stages=2,
 
 @tilelang.jit(pass_configs={"tl.disable_warp_specialized": True})
 def w13_swiglu_emaj_dyn_fused(E, N, K, block_K=128, num_stages=2, threads=256,
-                              lim=10.0, out_dtype=T.bfloat16):
+                              lim=10.0, out_dtype=T.bfloat16, sfb_native=True):
     """No-copy variant of w13_swiglu_emaj_dyn: reads gate/up halves straight
     from the FUSED stored weight B=(E, 2N, K) — gate rows [0,N), up rows
     [N,2N) per expert — instead of two .contiguous() half copies.
@@ -291,6 +328,7 @@ def w13_swiglu_emaj_dyn_fused(E, N, K, block_K=128, num_stages=2, threads=256,
     cause). Bit-exact vs the split variant; L2 behavior of the expert-major
     raster improves (gate+up adjacent), -9..-10% kernel time at bpe>=4
     (bench_fused_k1.py, 2026-10-06). Same rows+BM padding contract.
+    sfb_native: see w2_emaj_dyn_tbl.
     """
     assert N % 128 == 0 and K % block_K == 0 and block_K % 64 == 0
     k_blocks = K // block_K
@@ -300,14 +338,20 @@ def w13_swiglu_emaj_dyn_fused(E, N, K, block_K=128, num_stages=2, threads=256,
     in_dtype = T.float4_e2m1fn
     rows = T.dynamic("rows")
     bpe = T.dynamic("bpe")
+    Rn_sf = 2 * n_blocks
+    Cn_sf = k_blocks * words
+    if sfb_native:
+        sfb_words = E * Rn_sf * Cn_sf * 128
+    else:
+        sfb_words = E * n_blocks * k_blocks * BN * words
 
     @T.prim_func
     def main(
         A: T.Tensor((rows, K), in_dtype),
         B: T.Tensor((E, 2 * N, K), in_dtype),
         SFA: T.Tensor((E * bpe * BM * k_blocks, words), T.uint32),
-        SFBg: T.Tensor((E * n_blocks * k_blocks * BN, words), T.uint32),
-        SFBu: T.Tensor((E * n_blocks * k_blocks * BN, words), T.uint32),
+        SFBg: T.Tensor((sfb_words,), T.uint32),
+        SFBu: T.Tensor((sfb_words,), T.uint32),
         offsets: T.Tensor((E + 1,), T.int32),
         scale: T.Tensor((E,), T.float32),
         act: T.Tensor((rows, N), out_dtype),
@@ -337,9 +381,20 @@ def w13_swiglu_emaj_dyn_fused(E, N, K, block_K=128, num_stages=2, threads=256,
                 for r, w in T.Parallel(BM, words):
                     SFA_s[r, w] = SFA[((e * bpe + local) * k_blocks + ko) * BM + r, w]
                 for r, w in T.Parallel(BN, words):
-                    SFBg_s[r, w] = SFBg[((e * n_blocks + bn) * k_blocks + ko) * BN + r, w]
-                for r, w in T.Parallel(BN, words):
-                    SFBu_s[r, w] = SFBu[((e * n_blocks + bn) * k_blocks + ko) * BN + r, w]
+                    if sfb_native:
+                        flat = words * r + w
+                        kb = flat // 128
+                        intra = flat % 128
+                        idx = 32 * (intra % 4) + intra // 4
+                        sfb_off = (((e * Rn_sf + bn) * Cn_sf + ko * words + kb) * 128
+                                   + (idx % 32) * 4 + idx // 32)
+                        SFBg_s[r, w] = SFBg[sfb_off]
+                        SFBu_s[r, w] = SFBu[sfb_off + n_blocks * Cn_sf * 128]
+                    else:
+                        SFBg_s[r, w] = SFBg[
+                            (((e * n_blocks + bn) * k_blocks + ko) * BN + r) * words + w]
+                        SFBu_s[r, w] = SFBu[
+                            (((e * n_blocks + bn) * k_blocks + ko) * BN + r) * words + w]
                 T.mma_gemm_blockscaled(A_s, Bg_s, Cg, SFA_s, SFBg_s, transpose_B=True,
                                        clear_accum=False, k_start=ko * block_K,
                                        sf_a_granularity_k=16, sf_b_granularity_k=16,
@@ -362,7 +417,7 @@ def w13_swiglu_emaj_dyn_fused(E, N, K, block_K=128, num_stages=2, threads=256,
 
 @tilelang.jit(pass_configs={"tl.disable_warp_specialized": True})
 def w2_emaj_dyn_tbl(E, K, N, block_N=128, threads=128, num_stages=2,
-                    out_dtype=T.bfloat16):
+                    out_dtype=T.bfloat16, sfb_native=True):
     """Grouped w2 block-scaled GEMM, tile-table grid (2026-10-06).
 
     Per-expert ACTUAL tile counts (BM-aligned segments) instead of uniform
@@ -381,6 +436,15 @@ def w2_emaj_dyn_tbl(E, K, N, block_N=128, threads=128, num_stages=2,
     consecutive CTAs sweep bn within one expert (expert-major DRAM order) and
     sibling M-tiles of the same (expert, bn) B tile land in the same CTA wave
     for L2 reuse (the PR#8 raster, generalized to per-expert tile counts).
+
+    sfb_native (2026-10-11): read the weight block-scales DIRECTLY from the
+    checkpoint-native CUTLASS 128x4 swizzled tensor (flat uint32 view,
+    (E, K/128 atoms, Kp/4 u32 cols, 128-word atoms)) with the closed-form
+    inverse of the host kernel-order pack — instead of a prepacked
+    E*n_blocks*k_blocks*BN*words-u32 resident copy (~5.6GB/process at
+    E=144,N=2048,K=4096).  The smem SF tile fed to mma_gemm_blockscaled is
+    byte-identical => outputs bit-exact.  sfb_native=False keeps the packed
+    layout (SGLANG_TILELANG_MOE_SFB_REPACK=1 A/B + escape hatch).
     """
     assert K % block_N == 0 and block_N % 64 == 0 and N % 128 == 0
     k_blocks = N // block_N
@@ -390,13 +454,19 @@ def w2_emaj_dyn_tbl(E, K, N, block_N=128, threads=128, num_stages=2,
     in_dtype = T.float4_e2m1fn
     rows = T.dynamic("rows")
     tiles = T.dynamic("tiles")
+    Rn_sf = n_blocks            # native atom rows over K (w2 scale rows)
+    Cn_sf = k_blocks * words    # native u32 cols
+    if sfb_native:
+        sfb_words = E * Rn_sf * Cn_sf * 128
+    else:
+        sfb_words = E * n_blocks * k_blocks * BN * words
 
     @T.prim_func
     def main(
         A: T.Tensor((rows, N), in_dtype),
         B: T.Tensor((E, K, N), in_dtype),
         SFA: T.Tensor((tiles * BM * k_blocks, words), T.uint32),
-        SFB: T.Tensor((E * n_blocks * k_blocks * BN, words), T.uint32),
+        SFB: T.Tensor((sfb_words,), T.uint32),
         tile_e: T.Tensor((tiles,), T.int32),
         tile_base: T.Tensor((tiles,), T.int32),
         tile_act: T.Tensor((tiles,), T.int32),
@@ -420,7 +490,17 @@ def w2_emaj_dyn_tbl(E, K, N, block_N=128, threads=128, num_stages=2,
                 for r, w in T.Parallel(BM, words):
                     SFA_s[r, w] = SFA[(tid * k_blocks + ko) * BM + r, w]
                 for r, w in T.Parallel(BN, words):
-                    SFB_s[r, w] = SFB[((e * n_blocks + bn) * k_blocks + ko) * BN + r, w]
+                    if sfb_native:
+                        flat = words * r + w
+                        kb = flat // 128
+                        intra = flat % 128
+                        idx = 32 * (intra % 4) + intra // 4
+                        SFB_s[r, w] = SFB[
+                            ((e * Rn_sf + bn) * Cn_sf + ko * words + kb) * 128
+                            + (idx % 32) * 4 + idx // 32]
+                    else:
+                        SFB_s[r, w] = SFB[
+                            (((e * n_blocks + bn) * k_blocks + ko) * BN + r) * words + w]
                 T.mma_gemm_blockscaled(A_s, B_s, C, SFA_s, SFB_s, transpose_B=True,
                                        clear_accum=False, k_start=ko * block_N,
                                        sf_a_granularity_k=16, sf_b_granularity_k=16,
@@ -434,10 +514,15 @@ def w2_emaj_dyn_tbl(E, K, N, block_N=128, threads=128, num_stages=2,
 
 @tilelang.jit(pass_configs={"tl.disable_warp_specialized": True})
 def w13_swiglu_emaj_dyn_fused_tbl(E, N, K, block_K=128, num_stages=2, threads=256,
-                                  lim=10.0, out_dtype=T.bfloat16):
+                                  lim=10.0, out_dtype=T.bfloat16, sfb_native=True):
     """Grouped w13 (gate+up dual MMA from FUSED (E,2N,K) weight) + fused SwiGLU,
     tile-table grid (2026-10-06). See w2_emaj_dyn_tbl for the layout contract;
-    bit-exact vs w13_swiglu_emaj_dyn_fused given identical gathered operands."""
+    bit-exact vs w13_swiglu_emaj_dyn_fused given identical gathered operands.
+
+    sfb_native (2026-10-11): SFBg/SFBu are the SAME flat native swizzled
+    tensor (gate atoms [0,N/128), up atoms [N/128,2N/128) via +n_blocks row
+    offset) — no host-side gate/up split copies. See w2_emaj_dyn_tbl.
+    """
     assert N % 128 == 0 and K % block_K == 0 and block_K % 64 == 0
     k_blocks = K // block_K
     words = block_K // 64
@@ -446,14 +531,20 @@ def w13_swiglu_emaj_dyn_fused_tbl(E, N, K, block_K=128, num_stages=2, threads=25
     in_dtype = T.float4_e2m1fn
     rows = T.dynamic("rows")
     tiles = T.dynamic("tiles")
+    Rn_sf = 2 * n_blocks        # native atom rows over 2N (gate+up)
+    Cn_sf = k_blocks * words    # native u32 cols
+    if sfb_native:
+        sfb_words = E * Rn_sf * Cn_sf * 128
+    else:
+        sfb_words = E * n_blocks * k_blocks * BN * words
 
     @T.prim_func
     def main(
         A: T.Tensor((rows, K), in_dtype),
         B: T.Tensor((E, 2 * N, K), in_dtype),
         SFA: T.Tensor((tiles * BM * k_blocks, words), T.uint32),
-        SFBg: T.Tensor((E * n_blocks * k_blocks * BN, words), T.uint32),
-        SFBu: T.Tensor((E * n_blocks * k_blocks * BN, words), T.uint32),
+        SFBg: T.Tensor((sfb_words,), T.uint32),
+        SFBu: T.Tensor((sfb_words,), T.uint32),
         tile_e: T.Tensor((tiles,), T.int32),
         tile_base: T.Tensor((tiles,), T.int32),
         tile_act: T.Tensor((tiles,), T.int32),
@@ -484,9 +575,20 @@ def w13_swiglu_emaj_dyn_fused_tbl(E, N, K, block_K=128, num_stages=2, threads=25
                 for r, w in T.Parallel(BM, words):
                     SFA_s[r, w] = SFA[(tid * k_blocks + ko) * BM + r, w]
                 for r, w in T.Parallel(BN, words):
-                    SFBg_s[r, w] = SFBg[((e * n_blocks + bn) * k_blocks + ko) * BN + r, w]
-                for r, w in T.Parallel(BN, words):
-                    SFBu_s[r, w] = SFBu[((e * n_blocks + bn) * k_blocks + ko) * BN + r, w]
+                    if sfb_native:
+                        flat = words * r + w
+                        kb = flat // 128
+                        intra = flat % 128
+                        idx = 32 * (intra % 4) + intra // 4
+                        sfb_off = (((e * Rn_sf + bn) * Cn_sf + ko * words + kb) * 128
+                                   + (idx % 32) * 4 + idx // 32)
+                        SFBg_s[r, w] = SFBg[sfb_off]
+                        SFBu_s[r, w] = SFBu[sfb_off + n_blocks * Cn_sf * 128]
+                    else:
+                        SFBg_s[r, w] = SFBg[
+                            (((e * n_blocks + bn) * k_blocks + ko) * BN + r) * words + w]
+                        SFBu_s[r, w] = SFBu[
+                            (((e * n_blocks + bn) * k_blocks + ko) * BN + r) * words + w]
                 T.mma_gemm_blockscaled(A_s, Bg_s, Cg, SFA_s, SFBg_s, transpose_B=True,
                                        clear_accum=False, k_start=ko * block_K,
                                        sf_a_granularity_k=16, sf_b_granularity_k=16,
