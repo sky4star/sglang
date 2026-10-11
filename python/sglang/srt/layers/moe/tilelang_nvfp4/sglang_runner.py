@@ -28,6 +28,18 @@ Root causes removed (HANDOFF 2026-10-06 §14):
   - split-loop re-streaming ALL expert weights per MAX_CAP pass (P>=2048,
     85% of the e2e regression). No capacity concept remains: any skew just
     adds tiles.
+
+2026-10-11 K0 v2 + combine v2 (HANDOFF 2026-10-11 §6):
+  - K0 = quant_nat_dyn (natural-order quant-once, dense x read) +
+    fp4_gather_dyn (fp4 gather-repack into the UNCHANGED K1 contract:
+    dense A1 + tile-major SFA1sem, byte-identical to gather_quant_dyn).
+    Kills the routed-order x footprint tax (K0 serving 2.11 vs 0.76ms
+    offline); the repack's random reads stay L2-resident in the 16.8MB
+    fp4 payload.
+  - combine writes bf16 directly into `output` (contiguous (M,K) bf16
+    guard; pooled bf16 y + copy_ fallback otherwise) — no fp32 y, no
+    copy_ tax. Zero-scale slots (TP non-local) are redirected to out2
+    row 0 pre-launch (L2-hot phantom reads; bit-exact).
 """
 from __future__ import annotations
 
@@ -35,10 +47,11 @@ import os
 import time
 import types
 import torch
+import tilelang.language as T
 
 from .k1k3_emaj import w13_swiglu_emaj_dyn_fused_tbl, w2_emaj_dyn_tbl
 from .moe_combine_kernel import moe_combine_dyn
-from .act_quant_kernel import gather_quant_dyn
+from .act_quant_kernel import gather_quant_dyn, quant_nat_dyn, fp4_gather_dyn
 from .grouped_nvfp4_gemm import pack_scale_words, swizzle_chunk_kmajor
 
 ENABLED = os.environ.get("SGLANG_TILELANG_MOE", "0") == "1"
@@ -76,18 +89,32 @@ def _pbuf(key: str, numel: int, dtype, dev):
 def _warm_pool(E: int, N: int, K: int, m_max: int, rows_max: int, dev):
     """Pre-warm the pool at the worst serving shape.
 
-    rows_pad = rows + BM covers the gather-order tail-tile contract;
+    rows_pad_max = ceil128(rows_max) + BM covers the gather-order tail-tile
+    contract (2026-10-11: rows_pad is 128-aligned so the gather grid never
+    over-scans the index tensors);
     SFA sem/slabs round up to 128-row atoms (rows_pad is already a multiple
-    of 128 when rows_max is, else +127 slack).
+    of 128, else +127 slack).
     """
-    rows_pad_max = rows_max + BM
+    rows_pad_max = (rows_max + BM - 1) // BM * BM + BM   # 128-aligned + tail tile
     sem_max = rows_max + E * BM   # tiles_max*128; tiles_max <= rows_max/BM + E
     for key, numel, dt in (
         ("A1", rows_pad_max * (K // 2), torch.uint8),
         ("act", rows_pad_max * N, torch.bfloat16),
         ("A2", rows_pad_max * (N // 2), torch.uint8),
         ("out2", rows_pad_max * K, torch.bfloat16),
-        ("y", m_max * K, torch.float32),
+        # 2026-10-11: combine writes bf16 directly into the caller's output;
+        # the pooled y is now the bf16 fallback for non-contiguous outputs
+        # (was fp32 — half the bytes, no fp32 y + copy_ bandwidth tax).
+        ("y", m_max * K, torch.bfloat16),
+        # 2026-10-11 K0 v2: natural-order quant-once payload (fp4 + scales).
+        # 16.8MB + 2MB at m_max=8192, K=4096 — fits the 25MB L2 between the
+        # quant pass and the repack gather.  idxL/slotL: int64 gather indices
+        # for the torch index_select/index_copy_ repack; sfag: repack scratch.
+        ("Aqn", m_max * (K // 2), torch.uint8),
+        ("SFAn", m_max * (K // 16), torch.float8_e4m3fn),
+        ("idxL", rows_pad_max, torch.int64),
+        ("slotL", rows_pad_max, torch.int64),
+        ("sfag", rows_pad_max * (K // 16), torch.uint8),
         ("SFA1sem", sem_max * (K // 16), torch.float8_e4m3fn),
         ("SFA1sw", sem_max * (K // 64), torch.uint32),
         ("SFA2sem", sem_max * (N // 16), torch.float8_e4m3fn),
@@ -194,6 +221,12 @@ def run_tilelang_moe(*, x, topk_weights, topk_ids, quant_info, output):
     ep_rank = st["ep_rank"]
     M, topk = topk_ids.shape
     dev = x.device
+    if not x.is_contiguous():
+        # tilelang's packed-ABI check rejects strided X (gather kernels
+        # included — pre-existing since the 0.1.15 stride gate); serving
+        # dispatch always hands over contiguous hidden_states, this is a
+        # safety net for exotic callers.
+        x = x.contiguous()
     if trace:
         print(f"[tlmoe-trace] L{st['lid']} begin M={M}", flush=True)
 
@@ -230,7 +263,13 @@ def run_tilelang_moe(*, x, topk_weights, topk_ids, quant_info, output):
     # index tensors are rows_pad-long: gather_quant works on 128-row tiles of
     # the gather order; tail lanes duplicate lane 0 (idempotent writes — the
     # 2026-10-06 tail-tile corruption contract).
-    rows_pad = rows + BM
+    # 2026-10-11 FIX: rows_pad must be a MULTIPLE of 128.  gather_quant binds
+    # `rows` from the index tensor's shape and launches ceildiv(rows,128)
+    # blocks; with the old rows = rows+BM (arbitrary alignment) the grid
+    # over-scanned up to 127 lanes PAST the tensors -> OOB garbage-index
+    # reads/writes (nondeterministic SFA slot corruption under TP/EP; silent
+    # when rows itself is 128-aligned, e.g. single-GPU offline harnesses).
+    rows_pad = (rows + BM - 1) // BM * BM + BM
     src_rows = torch.empty(rows_pad, dtype=torch.int32, device=dev)
     src_rows[:rows] = token_of_pair[sorted_pairs].to(torch.int32)
     src_rows[rows:] = src_rows[0]
@@ -261,8 +300,25 @@ def run_tilelang_moe(*, x, topk_weights, topk_ids, quant_info, output):
     # (tail-tile contract above); lanes >= rows are never read for real
     # output rows (tile_act masks the epilogue).
 
-    # K0: gather + quant; Aq dense gather order, SFA sem tile-major
-    gather_quant_dyn(K, E)(x, src_rows, sfa_slot, A1, SFA1sem)
+    # K0 v2 (2026-10-11): quant-once in natural order (dense 67MB read,
+    # no routing dependency, bit-identical per-row quant) then fp4
+    # gather-repack into the unchanged K1 contract (A1 dense gather order,
+    # SFA1sem tile-major).  The repack's 2KB random reads stay inside the
+    # 16.8MB fp4 payload = L2-resident, killing the routed-order x footprint
+    # tax (268MB random DRAM reads -> ~86MB dense + ~38MB L2-hot).
+    Aq_nat = _pbuf("Aqn", M * (K // 2), torch.uint8, dev)[: M * (K // 2)].view(M, K // 2)
+    SFA_nat = _pbuf("SFAn", M * (K // 16), torch.float8_e4m3fn,
+                    dev)[: M * (K // 16)].view(M, K // 16)
+    quant_nat_dyn(K)(x, Aq_nat, SFA_nat)
+    t_stage = _tick(f"L{st['lid']} K0 quant-once done", t_stage)
+    idxL = _pbuf("idxL", rows_pad, torch.int64, dev)[:rows_pad]
+    idxL.copy_(src_rows)                       # int32 -> int64 (cast kernel)
+    slotL = _pbuf("slotL", rows_pad, torch.int64, dev)[:rows_pad]
+    slotL.copy_(sfa_slot)
+    sfa_g = _pbuf("sfag", rows_pad * (K // 16), torch.uint8,
+                  dev)[: rows_pad * (K // 16)].view(rows_pad, K // 16)
+    fp4_gather_dyn(K)(Aq_nat, SFA_nat.view(torch.uint8), idxL, slotL, A1,
+                      SFA1sem.view(torch.uint8), sfa_g)
     t_stage = _tick(f"L{st['lid']} K0 done", t_stage)
     # pack+swizzle, allocation-free: strided copy_ == chunk_kmajor swizzle;
     # slab s = gathered lanes [s*128,(s+1)*128) = tile s (tile-major SFA)
@@ -306,23 +362,50 @@ def run_tilelang_moe(*, x, topk_weights, topk_ids, quant_info, output):
     slot_rows.reshape(-1)[sorted_pairs] = dense_rows
     slot_scale.reshape(-1)[sorted_pairs] = (
         st["scale2"][expert_sorted] * topk_weights.reshape(-1).float()[sorted_pairs])
-    y = _pbuf("y", M * K, torch.float32, dev)[: M * K].view(M, K)
-    moe_combine_dyn(K, topk)(out2[:rows], slot_rows.contiguous(), slot_scale.contiguous(), y)
+    # zero-scale slots (TP non-local experts) contribute exactly +-0.0;
+    # redirect their gather reads to out2 row 0 so the phantom reads hit one
+    # L2-hot row instead of ~half of the 268MB out2 DRAM re-read (bit-exact:
+    # the added term is still 0.0*finite = +-0.0).  NO in-kernel predicate:
+    # predication serializes tilelang's FMA loop and changes rounding.
+    slot_rows.masked_fill_(slot_scale == 0.0, 0)
+    # combine v2 (2026-10-11): out_dtype=bfloat16, acc stays fp32 in
+    # registers — one RN cast, bit-identical to the old fp32 y + copy_ cast.
+    # Direct write into the caller's output when the buffer is writable
+    # as-is; the pooled bf16 y + copy_ path only survives for exotic
+    # outputs (non-contiguous / wrong shape).  Kills the fp32 y write+read
+    # and the copy_ read+write (~2.4ms/layer of pure bandwidth tax at
+    # M=8192, HANDOFF §4③).
+    direct_out = (
+        output.dtype == torch.bfloat16
+        and output.is_contiguous()
+        and output.dim() == 2
+        and output.shape[0] == M
+        and output.shape[1] == K
+    )
+    if direct_out:
+        moe_combine_dyn(K, topk, out_dtype=T.bfloat16)(
+            out2[:rows], slot_rows.contiguous(), slot_scale.contiguous(), output)
+    else:
+        y = _pbuf("y", M * K, torch.bfloat16, dev)[: M * K].view(M, K)
+        moe_combine_dyn(K, topk, out_dtype=T.bfloat16)(
+            out2[:rows], slot_rows.contiguous(), slot_scale.contiguous(), y)
+        output.copy_(y)
     t_stage = _tick(f"L{st['lid']} combine done", t_stage)
     if debug:
-        print(f"[tlmoe] combine done {time.perf_counter()-t_stage:.3f}s", flush=True)
-    output.copy_(y)
-    t_stage = _tick(f"L{st['lid']} copy out done", t_stage)
+        print(f"[tlmoe] combine done {time.perf_counter()-t_stage:.3}s direct={direct_out}",
+              flush=True)
     return output
 
 
 def precompile_tilelang_moe(model, num_tokens: int = 8192) -> bool:
-    """AOT-compile the 5 TileLang MoE kernels during engine init.
+    """AOT-compile the TileLang MoE kernels during engine init.
 
     Called from the model's `precompile_kernels_after_loading` hook (runs on
     every TP rank after weight load, before serving — symmetric across ranks,
     outside the serving watchdog). Kernels are shape-generic (symbolic dims),
     so one compile per kernel covers every future batch shape/tile count.
+    (2026-10-11: 6 jit functions per layer pass — K1 tbl, K2 gather_quant,
+    K3 tbl, quant_nat, fp4_gather, combine bf16.)
     """
     import torch.nn as nn
 

@@ -6,6 +6,19 @@
 No atomics: each token's ``topk`` rows are gathered and summed, writes to ``y``
 are contiguous.  ``slot_rows`` / ``slot_scale`` are the per-(token, slot) row
 index and (dequant * routing) scale, precomputed on the host.
+
+2026-10-11 (combine v2, HANDOFF 2026-10-11 §6.1):
+  - ``out_dtype=bfloat16`` + direct write into the caller's ``output`` kills
+    the fp32 ``y`` (134MB write + 134MB read) and the ``output.copy_(y)``
+    (134MB read + 67MB write) — a ~603MB -> ~402MB traffic cut worth
+    ~1.4-2.0ms/layer at M=8192.  acc stays fp32 in registers; one fp32->bf16
+    round-to-nearest cast, bit-identical to the old fp32-store + copy_ cast.
+  - slots with ``slot_scale == 0`` (TP non-local expert rows) are REDIRECTED
+    by the caller to out2 row 0 before launch (masked_fill_): the phantom
+    gather reads hit one L2-hot row instead of 268MB of DRAM (halves the
+    combine read under TP2).  An in-kernel ``if scale != 0`` predicate was
+    tried and REJECTED: tilelang lowers the predicated accumulator loop as
+    serial scalar ops -> FMA rounding changes -> not bit-exact.
 """
 import torch
 import tilelang
@@ -81,7 +94,9 @@ def moe_combine_dyn(
     threads: int = 128,
     out_dtype=T.float32,
 ):
-    """Shape-generic variant: M / rows symbolic (bound at call time)."""
+    """Shape-generic variant: M / rows symbolic (bound at call time).
+    2026-10-11: zero-scale slots skip the out2 read (bit-identical); callers
+    pass out_dtype=T.bfloat16 to write the caller's output buffer directly."""
     M = T.dynamic("M")
     rows = T.dynamic("rows")
 

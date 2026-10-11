@@ -169,3 +169,89 @@ def gather_quant_dyn(
             T.copy(y_sh, Aq[bm * blk_m, bk * block_N])
 
     return main
+
+
+@tilelang.jit(pass_configs={"tl.disable_warp_specialized": True})
+def quant_nat_dyn(
+    Cols: int,
+    blk_m: int = 128,
+    block_N: int = 128,
+    threads: int = 128,
+):
+    """K0 stage A (2026-10-11, HANDOFF §6.2): quant-once in NATURAL token
+    order.  Identical block-16 arithmetic to gather_quant_dyn (bit-identical
+    per row: the gather only permutes rows, quant is per-row/per-16-block),
+    but reads x densely once (67MB) instead of 268MB of random routed reads.
+
+    Row reads past S are clamped to S-1 (pool-backed Aq/SFA tail writes are
+    never consumed: the repack gathers rows only via src_row in [0, S))."""
+    assert Cols % block_N == 0 and block_N % 16 == 0
+    G = block_N // 16
+    in_dtype = T.bfloat16
+    e4 = T.float8_e4m3
+    e2 = T.float4_e2m1fn
+    S = T.dynamic("S")
+
+    @T.prim_func
+    def main(
+        X: T.Tensor((S, Cols), in_dtype),
+        Aq: T.Tensor((S, Cols), e2),
+        SFA: T.Tensor((S, Cols // 16), e4),
+    ):
+        with T.Kernel(T.ceildiv(S, blk_m), Cols // block_N, threads=threads) as (bm, bk):
+            x_sh = T.alloc_shared((blk_m, G, 16), in_dtype)
+            x_loc = T.alloc_fragment((blk_m, G, 16), in_dtype)
+            amax = T.alloc_fragment((blk_m, G), T.float32)
+            s_loc = T.alloc_fragment((blk_m, G), T.float32)
+            y_sh = T.alloc_shared((blk_m, block_N), e2)
+
+            for i, g, tt in T.Parallel(blk_m, G, 16):
+                x_sh[i, g, tt] = X[T.min(bm * blk_m + i, S - 1), bk * block_N + g * 16 + tt]
+            T.copy(x_sh, x_loc)
+            T.reduce_absmax(x_loc, amax, dim=2)
+            for i, g in T.Parallel(blk_m, G):
+                amax[i, g] = T.max(amax[i, g], 1e-6)
+                s_loc[i, g] = T.Cast("float32", T.Cast(e4, amax[i, g] / 6.0))
+            for i, g, tt in T.Parallel(blk_m, G, 16):
+                y_sh[i, g * 16 + tt] = T.clamp(x_loc[i, g, tt] / s_loc[i, g], -6.0, 6.0)
+            for i, g in T.Parallel(blk_m, G):
+                SFA[T.min(bm * blk_m + i, S - 1), bk * G + g] = T.Cast(e4, amax[i, g] / 6.0)
+            T.copy(y_sh, Aq[bm * blk_m, bk * block_N])
+
+    return main
+
+
+def fp4_gather_dyn(
+    Cols: int,
+    blk_m: int = 128,
+    threads: int = 256,
+):
+    """K0 stage B (2026-10-11, HANDOFF §6.2): fp4 gather-repack into the K1
+    contract layout.  Pure byte moves (fp4 payload is opaque here):
+
+        A1[i, :]             = Aq_nat[src_row[i], :]
+        SFA1[sfa_slot[i], :] = SFA_nat[src_row[i], :]
+
+    Random 2KB-row reads hit the 16.8MB fp4 payload (8192x4096) which fits in
+    the 25MB L2 right after quant_nat_dyn wrote it — DRAM only sees the dense
+    quant pass plus the sequential repack writes.  Tail lanes (>= rows)
+    duplicate lane 0, preserving the 2026-10-06 idempotent-write contract.
+
+    Implemented with torch index_select/index_copy_ (2KB-row gather is fully
+    vectorized there) because tilelang miscompiles contiguous uint8 vector
+    copies (make_ulonglong4 32-arg condval broadcast).  ALLOCATION CONTRACT:
+    src_row / sfa_slot must be int64 POOLED tensors and ``sfa_g`` a pooled
+    (rows, SB) uint8 scratch — all pre-warmed by the runner's _warm_pool;
+    this closure itself allocates nothing."""
+    def run(Aq_nat, SFA_nat_u8, src_row64, sfa_slot64, A1, SFA1_u8, sfa_g):
+        rows = src_row64.shape[0]
+        # int64 row views: index_select/index_copy_ on 1-byte elements copies
+        # byte-wise; 8-byte elements get vector row moves (~2x on GB10)
+        torch.index_select(Aq_nat.view(torch.int64), 0, src_row64,
+                           out=A1.view(torch.int64))
+        torch.index_select(SFA_nat_u8.view(torch.int64), 0, src_row64,
+                           out=sfa_g.view(torch.int64)[:rows])
+        SFA1_u8.view(torch.int64).index_copy_(0, sfa_slot64,
+                                              sfa_g.view(torch.int64)[:rows])
+
+    return run
