@@ -40,6 +40,15 @@ Root causes removed (HANDOFF 2026-10-06 §14):
     guard; pooled bf16 y + copy_ fallback otherwise) — no fp32 y, no
     copy_ tax. Zero-scale slots (TP non-local) are redirected to out2
     row 0 pre-launch (L2-hot phantom reads; bit-exact).
+
+2026-10-11 sfb-native-read (HANDOFF_sfb_native_read_20261011):
+  - SFB (weight block-scales) read DIRECTLY from the checkpoint-native
+    CUTLASS 128x4 swizzled tensors via zero-copy flat u32 views + the
+    closed-form inverse map inside K1/K3 — deletes the 3x repack chain in
+    _prepare_layer and its ~4.8-5.6GB/process resident copies (sfbg/sfbu/
+    sfb2).  Bit-exact by construction (same smem SF tiles); verified
+    byte-exact offline.  SGLANG_TILELANG_MOE_SFB_REPACK=1 restores the
+    old host repack path (A/B + escape hatch).
 """
 from __future__ import annotations
 
@@ -59,6 +68,13 @@ MIN_M = int(os.environ.get("SGLANG_TILELANG_MOE_MIN_M", "512"))
 BLOCK_K = 128
 BN = 128
 BM = 128
+# 2026-10-11 sfb-native-read: kernels address the checkpoint-native swizzled
+# weight block-scales in place (zero-copy u32 view, closed-form inverse of
+# the kernel-order pack) instead of a prepacked resident copy
+# (~4.8-5.6GB/process at E=144/N=2048/K=4096). SGLANG_TILELANG_MOE_SFB_REPACK=1
+# restores the old host repack path (A/B reference + escape hatch for
+# non-contiguous checkpoints).
+SFB_NATIVE_READ = os.environ.get("SGLANG_TILELANG_MOE_SFB_REPACK", "0") != "1"
 
 
 class CapacityOverflow(Exception):
@@ -171,6 +187,40 @@ def _prepare_layer(quant_info) -> dict:
         sw13 = sw13.unsqueeze(0)
     if sw2.dim() == 2:
         sw2 = sw2.unsqueeze(0)
+
+    scale1 = (quant_info.quant_scales[2] * quant_info.quant_scales[0]).float().reshape(E)
+    scale2 = (quant_info.quant_scales[5] * quant_info.quant_scales[3]).float().reshape(E)
+    st = dict(E=E, N=N, K=K, scale1=scale1, scale2=scale2,
+              ep_rank=int(quant_info.moe_ep_rank),
+              ep_size=int(quant_info.moe_ep_size))
+
+    # NO weight copies (2026-10-06): K1 reads quant_info.w13_weight FUSED
+    # (E,2N,Kh) directly and K3 reads quant_info.w2_weight (E,K,N/2) directly.
+    # 2026-10-11 sfb-native-read: the scale factors stay in the checkpoint's
+    # native CUTLASS 128x4 swizzled layout too — flat u32 VIEWS (zero-copy);
+    # the kernels reconstruct the kernel-order SF tiles with the closed-form
+    # inverse map (host-verified byte-exact vs this file's repack chain,
+    # validate_sfb_map*.py; real-checkpoint EXACT on all 288 experts x
+    # w13-gate/w13-up/w2).  GLM-clean pad shapes only (handoff §7-5):
+    # anything else fails the asserts loudly -> run with
+    # SGLANG_TILELANG_MOE_SFB_REPACK=1.
+    if SFB_NATIVE_READ:
+        if not (sw13.is_contiguous() and sw2.is_contiguous()):
+            print("[tlmoe] sfb native-read skipped: non-contiguous checkpoint "
+                  "scale (blob slice); falling back to repack for this layer",
+                  flush=True)
+        else:
+            Mp13, Kp13 = sw13.shape[-2], sw13.shape[-1]
+            Mp2, Kp2 = sw2.shape[-2], sw2.shape[-1]
+            assert Mp13 == twoN and Kp13 == K // 16, \
+                f"native-read shape mismatch w13 {(Mp13, Kp13)} != {(twoN, K // 16)}"
+            assert Mp2 == K and Kp2 == N // 16, \
+                f"native-read shape mismatch w2 {(Mp2, Kp2)} != {(K, N // 16)}"
+            st["mode"] = "native"
+            st["sfb_nat13"] = sw13.view(torch.uint32).reshape(-1)
+            st["sfb_nat2"] = sw2.view(torch.uint32).reshape(-1)
+            return st
+
     sem13 = _unswizzle_blockscale(sw13)
     sem2 = _unswizzle_blockscale(sw2)
     K16 = K // 16
@@ -181,18 +231,11 @@ def _prepare_layer(quant_info) -> dict:
     sfbu = _pack_kernel_order(sem13[:, N:].reshape(E * N, K16), BN, words)
     sfb2 = _pack_kernel_order(sem2.reshape(E * K, N // 16), BN, words)
 
-    scale1 = (quant_info.quant_scales[2] * quant_info.quant_scales[0]).float().reshape(E)
-    scale2 = (quant_info.quant_scales[5] * quant_info.quant_scales[3]).float().reshape(E)
-
-    # NO weight copies (2026-10-06): K1 reads quant_info.w13_weight FUSED
-    # (E,2N,Kh) directly and K3 reads quant_info.w2_weight (E,K,N/2) directly.
-    # Only the kernel-order scale repacks are retained, prepacked for ALL
-    # layers at init by precompile_tilelang_moe.
-    return dict(E=E, N=N, K=K,
-                sfbg=sfbg, sfbu=sfbu, sfb2=sfb2,
-                scale1=scale1, scale2=scale2,
-                ep_rank=int(quant_info.moe_ep_rank),
-                ep_size=int(quant_info.moe_ep_size))
+    st["mode"] = "repack"
+    st["sfbg"] = sfbg
+    st["sfbu"] = sfbu
+    st["sfb2"] = sfb2
+    return st
 
 
 def should_run(x) -> bool:
@@ -212,7 +255,8 @@ def run_tilelang_moe(*, x, topk_weights, topk_ids, quant_info, output):
     st = _states.get(id(quant_info.w13_weight))
     if st is None:
         if debug:
-            print("[tlmoe] layer prep (kernel-order scale repack)", flush=True)
+            print("[tlmoe] layer prep (sfb mode: "
+                  f"{'native-read' if SFB_NATIVE_READ else 'repack'})", flush=True)
         st = _prepare_layer(quant_info)
         st["lid"] = len(_states)
         _states[id(quant_info.w13_weight)] = st
@@ -331,9 +375,15 @@ def run_tilelang_moe(*, x, topk_weights, topk_ids, quant_info, output):
 
     # K1: fused w13 + SwiGLU, tile-table grid
     act = _pbuf("act", rows_pad * N, torch.bfloat16, dev)[: rows_pad * N].view(rows_pad, N)
-    k1 = w13_swiglu_emaj_dyn_fused_tbl(E, N, K, block_K=BLOCK_K, lim=10.0)
-    k1(A1, quant_info.w13_weight, SFA1, st["sfbg"], st["sfbu"], tile_e, tile_base,
-       tile_act, st["scale1"], act)
+    k1 = w13_swiglu_emaj_dyn_fused_tbl(E, N, K, block_K=BLOCK_K, lim=10.0,
+                                       sfb_native=(st["mode"] == "native"))
+    if st["mode"] == "native":
+        # gate+up share one native view; the kernel adds the +N/128 atom offset
+        k1(A1, quant_info.w13_weight, SFA1, st["sfb_nat13"], st["sfb_nat13"],
+           tile_e, tile_base, tile_act, st["scale1"], act)
+    else:
+        k1(A1, quant_info.w13_weight, SFA1, st["sfbg"].view(-1), st["sfbu"].view(-1),
+           tile_e, tile_base, tile_act, st["scale1"], act)
     t_stage = _tick(f"L{st['lid']} K1 done", t_stage)
 
     # K2: requant activated intermediate (dense, identical to proven layout)
@@ -351,8 +401,13 @@ def run_tilelang_moe(*, x, topk_weights, topk_ids, quant_info, output):
 
     # K3: grouped w2, tile-table grid
     out2 = _pbuf("out2", rows_pad * K, torch.bfloat16, dev)[: rows_pad * K].view(rows_pad, K)
-    k3 = w2_emaj_dyn_tbl(E, K, N, block_N=BLOCK_K)
-    k3(A2, quant_info.w2_weight, SFA2, st["sfb2"], tile_e, tile_base, tile_act, out2)
+    k3 = w2_emaj_dyn_tbl(E, K, N, block_N=BLOCK_K, sfb_native=(st["mode"] == "native"))
+    if st["mode"] == "native":
+        k3(A2, quant_info.w2_weight, SFA2, st["sfb_nat2"], tile_e, tile_base,
+           tile_act, out2)
+    else:
+        k3(A2, quant_info.w2_weight, SFA2, st["sfb2"].view(-1), tile_e, tile_base,
+           tile_act, out2)
     t_stage = _tick(f"L{st['lid']} K3 done", t_stage)
 
     # combine: slot -> dense gathered row (identical to the proven layout)
@@ -452,6 +507,7 @@ def precompile_tilelang_moe(model, num_tokens: int = 8192) -> bool:
     # (2026-10-06): the serving path must never lazily _prepare_layer —
     # per-layer first-use prep is what froze the host (NVRM OOM storm).
     n_prep = 0
+    n_nat = 0
     for m in layers:
         qs = [
             m.w13_input_scale_quant, m.w13_blockscale_swizzled, m.g1_alphas,
@@ -468,7 +524,13 @@ def precompile_tilelang_moe(model, num_tokens: int = 8192) -> bool:
         st["lid"] = len(_states)
         _states[id(m.w13_weight)] = st
         n_prep += 1
-    print(f"[tlmoe] prepacked kernel-order scales for {n_prep}/{len(layers)} MoE layers", flush=True)
+        n_nat += 1 if st["mode"] == "native" else 0
+    # Acceptance grep (2026-10-11): "sfb prep done" replaces the old
+    # "prepacked kernel-order scales" line; repack>0 under native-read means
+    # per-layer non-contiguous fallbacks (handoff §7-1 — record the share).
+    print(f"[tlmoe] sfb prep done: native={n_nat}/{n_prep} repack={n_prep - n_nat} "
+          f"MoE layers (SGLANG_TILELANG_MOE_SFB_REPACK="
+          f"{'1' if not SFB_NATIVE_READ else '0'})", flush=True)
     g = torch.Generator(device=dev).manual_seed(0)
     X = torch.randn(num_tokens, K, device=dev, dtype=torch.bfloat16, generator=g) / 10
     score = torch.randn(num_tokens, E, device=dev, dtype=torch.bfloat16, generator=g)
