@@ -85,6 +85,47 @@ def _jit_combine_module(k: int) -> Module:
     )
 
 
+# ---- chain fusion (2026-10-14, HANDOFF §13.4 F1/F2) --------------------------
+# F1: reduce+swiglu+requant in one kernel (gemm1 epilogue; drops bf16 g1 + 6
+#     eager swiglu ops + fp4_quantize).
+# F2: gather+quant in one kernel (gemm1 prologue; drops index_put+gather+
+#     fp4_quantize and the x_exp round trip).
+# Both replicate the torch-chain bytes bit-exactly (test_fused_act.py);
+# SGLANG_DECODE_MOE_FUSED_ACT / SGLANG_DECODE_MOE_FUSED_GATHER = auto|torch.
+
+
+@cache_once
+def _jit_actquant_module(n1: int, nr: int, slices: int) -> Module:
+    args = make_cpp_args(n1, nr, KCAP, slices)
+    return load_jit(
+        "decode_nvfp4_moe_actquant",
+        *args,
+        cuda_files=[_CUH],
+        cuda_wrappers=[("run", f"sglang::DecodeNvfp4MoeActQuant<{args}>::run")],
+        extra_cuda_cflags=["-O3"],
+    )
+
+
+@cache_once
+def _jit_gatherquant_module(k: int) -> Module:
+    args = make_cpp_args(k, KCAP)
+    return load_jit(
+        "decode_nvfp4_moe_gatherquant",
+        *args,
+        cuda_files=[_CUH],
+        cuda_wrappers=[("run", f"sglang::DecodeNvfp4MoeGatherQuant<{args}>::run")],
+        extra_cuda_cflags=["-O3"],
+    )
+
+
+def _fused_act_enabled() -> bool:
+    return os.environ.get("SGLANG_DECODE_MOE_FUSED_ACT", "auto") != "torch"
+
+
+def _fused_gather_enabled() -> bool:
+    return os.environ.get("SGLANG_DECODE_MOE_FUSED_GATHER", "auto") != "torch"
+
+
 def decode_nvfp4_gemm_out(
     a_q: torch.Tensor,
     a_sf: torch.Tensor,
@@ -133,6 +174,12 @@ def _pool(dev: torch.device, e: int, n1: int, kb1: int, n2: int, kb2: int, k: in
             "partials2": torch.zeros(2, KCAP, n2, dtype=torch.float32, device=dev),
             "g1": torch.empty(KCAP, n1, dtype=torch.bfloat16, device=dev),
             "g2": torch.empty(KCAP, n2, dtype=torch.bfloat16, device=dev),
+            # fused-act (F1) outputs: quantized gemm2 activations
+            "a2_q": torch.zeros(KCAP, n1 // 4, dtype=torch.uint8, device=dev),
+            "a2_sf": torch.zeros(128, n1 // 32, dtype=torch.uint8, device=dev),
+            # fused-gather (F2) outputs: quantized gemm1 activations
+            "a_q": torch.zeros(KCAP, kb1, dtype=torch.uint8, device=dev),
+            "a_sf1": torch.zeros(128, kb1 // 8, dtype=torch.uint8, device=dev),
             # routing bookkeeping outputs (fused path; R <= R_CAP)
             "order": torch.empty(R_CAP, dtype=torch.int32, device=dev),
             "inv": torch.empty(R_CAP, dtype=torch.int32, device=dev),
@@ -231,9 +278,10 @@ def decode_nvfp4_moe_forward(
     Chain mode (SGLANG_DECODE_MOE_CHAIN, default "auto"): "auto" uses the fused
     single-pass routing + combine kernels when R = T*topk <= R_CAP (32), else
     the eager torch path; "torch" forces the torch path everywhere.
+    Fusion modes (default "auto" = fused): SGLANG_DECODE_MOE_FUSED_ACT /
+    SGLANG_DECODE_MOE_FUSED_GATHER = "torch" falls back to the eager
+    reduce+swiglu+quant / gather+quant epilogue and prologue respectively.
     """
-    from flashinfer import fp4_quantize
-
     t, k = x.shape
     topk = topk_ids.shape[1]
     e, n1, kb1 = w13.shape
@@ -257,33 +305,52 @@ def decode_nvfp4_moe_forward(
     pad_v, tok_v = pad_row[:r], token_of[:r]
 
     # gather + quantize gemm1 activations
-    x_exp = buf["x_exp"]
-    x_exp[pad_v] = x[tok_v]
-    a_q, a_sf = fp4_quantize(x_exp, global_scale=q0, sf_vec_size=16,
-                             is_sf_swizzled_layout=True)
+    if _fused_gather_enabled():
+        a_q, a_sf = buf["a_q"], buf["a_sf1"]
+        _jit_gatherquant_module(k).run(x, pad_v, tok_v, r, q0.reshape(1), a_q, a_sf)
+    else:
+        from flashinfer import fp4_quantize
 
-    # gemm1 (K1d): [KCAP, 2*Nr] = a_q @ w13^T, per-row expert alpha epilogue
-    g1 = buf["g1"]
-    decode_nvfp4_gemm_out(a_q, a_sf, w13, w13_sf.view(torch.uint8), mip,
-                          active_ids, g1_alphas, buf["partials1"], g1)
+        x_exp = buf["x_exp"]
+        x_exp[pad_v] = x[tok_v]
+        a_q, a_sf = fp4_quantize(x_exp, global_scale=q0, sf_vec_size=16,
+                                 is_sf_swizzled_layout=True)
 
-    # swiglu in fp32 math (matches the cutlass doActivation contract; the
-    # GPT-OSS-style clamp hits gate and up EACH, before silu*mul).
-    # w13 row layout is the serving one: [up; gate] (gate = SECOND half) —
-    # the cutlass gated-swiglu epilogue silu's the second half, and sglang
-    # loads w13 up-proj-first (load_up_proj_weight_first) for the cutlass
-    # backend. 2026-10-14: the [gate; up] assumption here was the serving
-    # quality-collapse root cause (silu(up)*gate every block).
-    nr = n1 // 2
-    g1_up = g1[:, :nr].float()
-    g1_gate = g1[:, nr:].float()
-    if swiglu_limit is not None:
-        lim = float(swiglu_limit)
-        g1_gate = g1_gate.clamp(-lim, lim)
-        g1_up = g1_up.clamp(-lim, lim)
-    y = torch.nn.functional.silu(g1_gate) * g1_up
-    a2_q, a2_sf = fp4_quantize(y.to(torch.bfloat16), global_scale=q3,
-                               sf_vec_size=16, is_sf_swizzled_layout=True)
+    # gemm1 (K1d) split: partials = a_q @ w13^T slices
+    w13_u8 = w13_sf.view(torch.uint8)
+    _jit_split_module(n1, kb1, buf["partials1"].shape[0]).run(
+        a_q, a_sf, w13, w13_u8, mip, active_ids, buf["partials1"])
+
+    if _fused_act_enabled():
+        # F1 epilogue: reduce+swiglu+requant in one kernel (bit-exact vs the
+        # torch path below; [up; gate] serving layout — gate is the SECOND half)
+        a2_q, a2_sf = buf["a2_q"], buf["a2_sf"]
+        lim = float("inf") if swiglu_limit is None else float(swiglu_limit)
+        _jit_actquant_module(n1, n1 // 2, buf["partials1"].shape[0]).run(
+            buf["partials1"], mip, g1_alphas, q3.reshape(1), lim, a2_q, a2_sf)
+    else:
+        from flashinfer import fp4_quantize
+
+        g1 = buf["g1"]
+        _jit_reduce_module(n1, buf["partials1"].shape[0]).run(
+            buf["partials1"], mip, g1_alphas, g1)
+        # swiglu in fp32 math (matches the cutlass doActivation contract; the
+        # GPT-OSS-style clamp hits gate and up EACH, before silu*mul).
+        # w13 row layout is the serving one: [up; gate] (gate = SECOND half) —
+        # the cutlass gated-swiglu epilogue silu's the second half, and sglang
+        # loads w13 up-proj-first (load_up_proj_weight_first) for the cutlass
+        # backend. 2026-10-14: the [gate; up] assumption here was the serving
+        # quality-collapse root cause (silu(up)*gate every block).
+        nr = n1 // 2
+        g1_up = g1[:, :nr].float()
+        g1_gate = g1[:, nr:].float()
+        if swiglu_limit is not None:
+            lim = float(swiglu_limit)
+            g1_gate = g1_gate.clamp(-lim, lim)
+            g1_up = g1_up.clamp(-lim, lim)
+        y = torch.nn.functional.silu(g1_gate) * g1_up
+        a2_q, a2_sf = fp4_quantize(y.to(torch.bfloat16), global_scale=q3,
+                                   sf_vec_size=16, is_sf_swizzled_layout=True)
 
     # gemm2 (K3d): [KCAP, K]
     g2 = buf["g2"]

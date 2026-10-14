@@ -340,39 +340,99 @@ __global__ void __launch_bounds__(WARPS * 32) decode_nvfp4_gemv_split_kernel(
 //   (contract: alpha last, never intermediate bf16 rounding).
 //
 // Rows with no segment (m >= Mp) have an all-zero partial column -> write 0.
-template <uint32_t N, uint32_t KCAP, uint32_t SLICES, uint32_t THREADS>
+// The chain reads EVERY out row (g1 rows >= Mp feed swiglu/fp4_quantize), so
+// the zero-fill is part of the contract, not an optimization.
+//
+// v2 (2026-10-14): v1's shape (grid = N/THREADS, serial walk of all KCAP
+// rows, scalar loads) starved the GPU: 8 CTAs on 48 SMs, 1.2% memory
+// throughput, L2 hit 7-11%, long_scoreboard 73% of stall (NCU uniform_T1).
+// v2 structure:
+//   * 2D grid (n-span x KCAP/TILE_M m-tiles) = 128-256 CTAs; tiles fully
+//     >= Mp zero-fill and return before staging m_indptr (grid is
+//     compile-time only -> still CUDA-graph safe, Mp is a device value)
+//   * rows < Mp read only the Mp partial rows: 4MB -> Mp*N*SLICES*4B
+//   * float4 loads, 4-across stores
+// Element-wise math is v1-identical (s-ascending fp32 sum, alpha last,
+// single bf16 cast; v1 rows >= Mp wrote bf16(sum*0)=+0, v2 writes 0x0000)
+// -> bit-exact.
+template <uint32_t N, uint32_t KCAP, uint32_t SLICES, uint32_t THREADS,
+          uint32_t TILE_M = 2, uint32_t VEC = 4>
 __global__ void decode_nvfp4_gemv_reduce_kernel(
     const float* __restrict__ partials,
     const int32_t* __restrict__ m_indptr,
     const float* __restrict__ alphas,
     bf16_t* __restrict__ out,
     int32_t num_experts) {
-  __shared__ int32_t s_mip[1025];
+  static_assert(N % (THREADS * VEC) == 0, "n-span must tile N");
+  static_assert(KCAP % TILE_M == 0, "m-tiles must tile KCAP");
+  static_assert(VEC == 4, "reduce body is float4/uint2 shaped");
   const uint32_t tid = threadIdx.x;
+  const int32_t mp = m_indptr[num_experts];
+  const uint32_t m0 = blockIdx.y * TILE_M;
+  const uint32_t n0 = (blockIdx.x * THREADS + tid) * VEC;
+  if (static_cast<int32_t>(m0) >= mp) {
+    // pure padding tile: honor the zero contract without staging m_indptr
+#pragma unroll
+    for (uint32_t t = 0; t < TILE_M; ++t) {
+      *reinterpret_cast<uint2*>(&out[static_cast<size_t>(m0 + t) * N + n0]) =
+          make_uint2(0u, 0u);
+    }
+    return;
+  }
+  __shared__ int32_t s_mip[1025];
+  __shared__ int32_t s_exp[TILE_M];
   for (int32_t i = tid; i <= num_experts; i += THREADS) {
     s_mip[i] = m_indptr[i];
   }
-  __syncthreads();
-  static_assert(KCAP <= 1024);
-  const uint32_t n = blockIdx.x * THREADS + tid;
-  for (uint32_t m = 0; m < KCAP; ++m) {
+  __syncthreads();  // staging complete before the tid<TILE_M search reads s_mip
+  if (tid < TILE_M) {
+    const int32_t m = static_cast<int32_t>(m0 + tid);
     int32_t lo = 0, hi = num_experts;
-    while (lo < hi) {
-      const int32_t mid = (lo + hi) >> 1;
-      if (s_mip[mid + 1] <= static_cast<int32_t>(m)) {
-        lo = mid + 1;
-      } else {
-        hi = mid;
+    if (m < mp) {
+      while (lo < hi) {
+        const int32_t mid = (lo + hi) >> 1;
+        if (s_mip[mid + 1] <= m) {
+          lo = mid + 1;
+        } else {
+          hi = mid;
+        }
       }
+      if (!(lo < num_experts && s_mip[lo] <= m)) {
+        lo = -1;
+      }
+    } else {
+      lo = -1;
     }
-    const bool found = lo < num_experts && s_mip[lo] <= static_cast<int32_t>(m);
-    float acc = 0.0f;
+    s_exp[tid] = lo;
+  }
+  __syncthreads();
+#pragma unroll
+  for (uint32_t t = 0; t < TILE_M; ++t) {
+    const uint32_t m = m0 + t;
+    const int32_t e = s_exp[t];
+    if (e < 0) {
+      *reinterpret_cast<uint2*>(&out[static_cast<size_t>(m) * N + n0]) =
+          make_uint2(0u, 0u);
+      continue;
+    }
+    float acc[VEC] = {};
 #pragma unroll
     for (uint32_t s = 0; s < SLICES; ++s) {
-      acc += partials[(static_cast<size_t>(s) * KCAP + m) * N + n];
+      const float4 p = *reinterpret_cast<const float4*>(
+          &partials[(static_cast<size_t>(s) * KCAP + m) * N + n0]);
+      acc[0] += p.x;
+      acc[1] += p.y;
+      acc[2] += p.z;
+      acc[3] += p.w;
     }
-    const float alpha = found ? alphas[lo] : 0.0f;
-    out[static_cast<size_t>(m) * N + n] = cast<bf16_t>(acc * alpha);
+    const float alpha = alphas[e];
+    alignas(8) bf16_t v[VEC];
+#pragma unroll
+    for (uint32_t j = 0; j < VEC; ++j) {
+      v[j] = cast<bf16_t>(acc[j] * alpha);
+    }
+    *reinterpret_cast<uint2*>(&out[static_cast<size_t>(m) * N + n0]) =
+        *reinterpret_cast<const uint2*>(v);
   }
 }
 
@@ -497,6 +557,270 @@ __global__ void decode_nvfp4_moe_combine_kernel(
   out[static_cast<size_t>(t) * K + k] = cast<bf16_t>(acc);
 }
 
+// ---- NVFP4 requant helpers (chain F1/F2, 2026-10-14) ------------------------
+//
+// Bit-exact replication of flashinfer fp4_quantize (TRT-LLM quantize_with_block
+// _size, FP16_TO_FP4, fast-math path: rcp.approx.ftz + cvt.rn.satfinite.e2m1x2
+// + e4m3 RN SATFINITE sf). Verified byte-exact by test_fused_act.py on real
+// chain activations (12 oracle cases) — including the all-zero-group rule
+// (amax==0 -> sf byte 0, data 0) and the swizzled 128x4 SF offset formula
+// off(m,kb) = (kb/4)*512 + (m%32)*16 + ((m%128)/32)*4 + kb%4, which is the
+// same closed form the split kernel reads activations with.
+
+__device__ __forceinline__ float rcp_approx_ftz(float a) {
+  float b;
+  asm volatile("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(b) : "f"(a));
+  return b;
+}
+
+// Group amax -> (sf byte, output scale). amax must be the exact f32 max of
+// |v| over the 16-value group (v are exact f32 of bf16 values).
+__device__ __forceinline__ float2 nvfp4_group_scale(float amax, float gs) {
+  const float sf_val = gs * (amax * rcp_approx_ftz(6.0f));
+  __nv_fp8_e4m3 sf8(sf_val);
+  const float os = (amax != 0.0f)
+                       ? rcp_approx_ftz(static_cast<float>(sf8) * rcp_approx_ftz(gs))
+                       : 0.0f;
+  return make_float2(static_cast<float>(sf8.__x), os);  // .x = sf byte as float bits
+}
+
+// Swizzled 128x4 activation-SF offset (single 128-row tile, no batch).
+__device__ __forceinline__ uint32_t act_sf_offset(uint32_t m, uint32_t kb) {
+  return (kb >> 2) * 512 + (m & 31) * 16 + ((m & 127) >> 5) * 4 + (kb & 3);
+}
+
+// ---- fused reduce + swiglu + NVFP4 requant (gemm1 epilogue, chain F1) --------
+//
+// Replaces reduce1 (bf16 g1) + eager swiglu (~6 ops) + fp4_quantize with ONE
+// kernel (§13.4-F1): partials1 -> slice-sum -> alpha -> swiglu -> quant, so
+// the g1 round trip (512KB) and 7-8 graph nodes/blk disappear. The K1d split
+// kernel is UNCHANGED (partials contract identical).
+//
+// Bit-exact vs the torch epilogue it replaces:
+//   u/g    = f32(bf16(alpha * sum_s partials[s][m][j | j+NR]))   (reduce math)
+//   clamp  = comparison form (NaN propagates; torch clamp semantics)
+//   y      = bf16( (g / (1 + expf(-g))) * u )                    (torch fp32 silu)
+//   quant  = flashinfer fast-math recipe (nvfp4_group_scale above)
+// limit = +inf disables the clamp (fmin/fmax-free comparison form keeps this
+// exact: v < -inf is false for every finite v).
+//
+// Grid = (NR/(THREADS*VEC), KCAP/TILE_M); VEC=4 -> each 16-value SF group is
+// owned by 4 consecutive lanes (shuffle amax, leader stores the sf byte,
+// u16 data stores). Rows >= Mp (and orphan rows) fill literal zeros, matching
+// flashinfer-on-zeros so the a2 buffers stay byte-stable across calls.
+template <uint32_t N1, uint32_t NR, uint32_t KCAP, uint32_t SLICES, uint32_t THREADS,
+          uint32_t TILE_M = 2, uint32_t VEC = 4>
+__global__ void decode_nvfp4_moe_actquant_kernel(
+    const float* __restrict__ partials,
+    const int32_t* __restrict__ m_indptr,
+    const float* __restrict__ alphas,
+    const float* __restrict__ global_scale,
+    float limit,
+    uint8_t* __restrict__ a_q,   // [KCAP, NR/2] packed e2m1
+    uint8_t* __restrict__ a_sf,  // [128, NR/16] swizzled e4m3
+    int32_t num_experts) {
+  static_assert(NR % (THREADS * VEC) == 0, "n-span must tile NR");
+  static_assert(KCAP % TILE_M == 0, "m-tiles must tile KCAP");
+  static_assert(KCAP <= 128, "activation SF closed form assumes a single 128-row tile");
+  static_assert(VEC == 4, "actquant body is float4/u16 shaped");
+
+  const uint32_t tid = threadIdx.x;
+  const int32_t mp = m_indptr[num_experts];
+  const uint32_t m0 = blockIdx.y * TILE_M;
+  const uint32_t j0 = (blockIdx.x * THREADS + tid) * VEC;  // y-column base
+  const uint32_t kb = j0 >> 4;                             // SF block within the row
+  const bool sf_leader = (tid & 3u) == 0;
+
+  auto fill_zero = [&](uint32_t m) {
+    *reinterpret_cast<uint16_t*>(&a_q[static_cast<size_t>(m) * (NR / 2) + (j0 >> 1)]) =
+        uint16_t{0};
+    if (sf_leader) {
+      a_sf[act_sf_offset(m, kb)] = 0;
+    }
+  };
+
+  if (static_cast<int32_t>(m0) >= mp) {
+#pragma unroll
+    for (uint32_t t = 0; t < TILE_M; ++t) {
+      fill_zero(m0 + t);
+    }
+    return;
+  }
+  __shared__ int32_t s_mip[1025];
+  __shared__ int32_t s_exp[TILE_M];
+  for (int32_t i = tid; i <= num_experts; i += THREADS) {
+    s_mip[i] = m_indptr[i];
+  }
+  __syncthreads();  // staging complete before the tid<TILE_M search reads s_mip
+  if (tid < TILE_M) {
+    const int32_t m = static_cast<int32_t>(m0 + tid);
+    int32_t lo = 0, hi = num_experts;
+    if (m < mp) {
+      while (lo < hi) {
+        const int32_t mid = (lo + hi) >> 1;
+        if (s_mip[mid + 1] <= m) {
+          lo = mid + 1;
+        } else {
+          hi = mid;
+        }
+      }
+      if (!(lo < num_experts && s_mip[lo] <= m)) {
+        lo = -1;
+      }
+    } else {
+      lo = -1;
+    }
+    s_exp[tid] = lo;
+  }
+  __syncthreads();
+  const float gs = *global_scale;
+#pragma unroll
+  for (uint32_t t = 0; t < TILE_M; ++t) {
+    const uint32_t m = m0 + t;
+    const int32_t e = s_exp[t];
+    if (e < 0) {
+      fill_zero(m);
+      continue;
+    }
+    const float alpha = alphas[e];
+    float vu[VEC], vg[VEC];
+#pragma unroll
+    for (uint32_t j = 0; j < VEC; ++j) {
+      vu[j] = 0.0f;
+      vg[j] = 0.0f;
+    }
+#pragma unroll
+    for (uint32_t s = 0; s < SLICES; ++s) {
+      // per-column s-ascending fp32 sum == the reduce kernel's order
+      const float4 pu = *reinterpret_cast<const float4*>(
+          &partials[(static_cast<size_t>(s) * KCAP + m) * N1 + j0]);
+      const float4 pg = *reinterpret_cast<const float4*>(
+          &partials[(static_cast<size_t>(s) * KCAP + m) * N1 + NR + j0]);
+      vu[0] += pu.x;
+      vu[1] += pu.y;
+      vu[2] += pu.z;
+      vu[3] += pu.w;
+      vg[0] += pg.x;
+      vg[1] += pg.y;
+      vg[2] += pg.z;
+      vg[3] += pg.w;
+    }
+#pragma unroll
+    for (uint32_t j = 0; j < VEC; ++j) {
+      // reduce contract: alpha last, single bf16 round, exact f32 widening
+      vu[j] = cast<bf16_t>(vu[j] * alpha);
+      vg[j] = cast<bf16_t>(vg[j] * alpha);
+    }
+    float v[VEC];
+#pragma unroll
+    for (uint32_t j = 0; j < VEC; ++j) {
+      float g = vg[j], u = vu[j];
+      g = (g < -limit) ? -limit : g;
+      g = (g > limit) ? limit : g;
+      u = (u < -limit) ? -limit : u;
+      u = (u > limit) ? limit : u;
+      g = g / (1.0f + expf(-g));
+      v[j] = cast<bf16_t>(g * u);
+    }
+    float amax = 0.0f;
+#pragma unroll
+    for (uint32_t j = 0; j < VEC; ++j) {
+      amax = fmaxf(amax, fabsf(v[j]));
+    }
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+    amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 2));
+    const float2 so = nvfp4_group_scale(amax, gs);
+    if (sf_leader) {
+      a_sf[act_sf_offset(m, kb)] = static_cast<uint8_t>(so.x);
+    }
+    const float os = so.y;
+    const auto b0 =
+        __nv_cvt_float2_to_fp4x2(make_float2(v[0] * os, v[1] * os), __NV_E2M1, cudaRoundNearest);
+    const auto b1 =
+        __nv_cvt_float2_to_fp4x2(make_float2(v[2] * os, v[3] * os), __NV_E2M1, cudaRoundNearest);
+    *reinterpret_cast<uint16_t*>(&a_q[static_cast<size_t>(m) * (NR / 2) + (j0 >> 1)]) =
+        static_cast<uint16_t>(static_cast<uint16_t>(static_cast<uint8_t>(b0)) |
+                              (static_cast<uint16_t>(static_cast<uint8_t>(b1)) << 8));
+  }
+}
+
+// ---- fused gather + NVFP4 quantize (gemm1 prologue, chain F2) ----------------
+//
+// Replaces index_put + gather + fp4_quantize (3 kernels + the 1MB x_exp round
+// trip) with ONE kernel: a_q[pad_v[i]] = quant(x[tok_v[i]]). Every CTA scans
+// the (<= 32-entry) pad list once for its row (thread 0 + smem broadcast);
+// rows absent from the list fill literal zeros (== flashinfer on zero rows).
+// Per thread: 8 bf16 values (uint4); the 16-value SF group spans 2 lanes
+// (shfl_xor amax, leader stores the sf byte, u32 data store).
+template <uint32_t K, uint32_t KCAP, uint32_t THREADS = 256>
+__global__ void decode_nvfp4_moe_gatherquant_kernel(
+    const bf16_t* __restrict__ x,        // [T, K]
+    const int64_t* __restrict__ pad_v,   // [R] destination padded rows
+    const int64_t* __restrict__ tok_v,   // [R] source token rows
+    int32_t r,
+    const float* __restrict__ global_scale,
+    uint8_t* __restrict__ a_q,           // [KCAP, K/2] packed e2m1
+    uint8_t* __restrict__ a_sf) {        // [128, K/16] swizzled e4m3
+  static_assert(K % (THREADS * 8) == 0, "n-span must tile K");
+  static_assert(KCAP <= 128, "activation SF closed form assumes a single 128-row tile");
+
+  __shared__ int32_t s_src;
+  const uint32_t row = blockIdx.y;
+  if (threadIdx.x == 0) {
+    int32_t src = -1;
+    for (int32_t i = 0; i < r; ++i) {
+      if (pad_v[i] == static_cast<int64_t>(row)) {
+        src = static_cast<int32_t>(tok_v[i]);
+        break;
+      }
+    }
+    s_src = src;
+  }
+  __syncthreads();
+  const int32_t src = s_src;
+  const uint32_t tid = blockIdx.x * THREADS + threadIdx.x;
+  const uint32_t j0 = tid * 8;  // value offset within the row
+  const uint32_t kb = j0 >> 4;
+  const bool leader = (threadIdx.x & 1u) == 0;
+  uint8_t* const qptr = a_q + static_cast<size_t>(row) * (K / 2) + (j0 >> 1);
+
+  if (src < 0) {
+    *reinterpret_cast<uint32_t*>(qptr) = 0u;
+    if (leader) {
+      a_sf[act_sf_offset(row, kb)] = 0;
+    }
+    return;
+  }
+  const uint4 xv =
+      *reinterpret_cast<const uint4*>(x + static_cast<size_t>(src) * K + j0);
+  const bf16_t* xb = reinterpret_cast<const bf16_t*>(&xv);
+  float v[8];
+#pragma unroll
+  for (uint32_t j = 0; j < 8; ++j) {
+    v[j] = static_cast<float>(xb[j]);
+  }
+  float amax = 0.0f;
+#pragma unroll
+  for (uint32_t j = 0; j < 8; ++j) {
+    amax = fmaxf(amax, fabsf(v[j]));
+  }
+  amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, 1));
+  const float gs = *global_scale;
+  const float2 so = nvfp4_group_scale(amax, gs);
+  if (leader) {
+    a_sf[act_sf_offset(row, kb)] = static_cast<uint8_t>(so.x);
+  }
+  const float os = so.y;
+  uint32_t packed = 0u;
+#pragma unroll
+  for (uint32_t j = 0; j < 4; ++j) {
+    const auto b = __nv_cvt_float2_to_fp4x2(make_float2(v[2 * j] * os, v[2 * j + 1] * os),
+                                            __NV_E2M1, cudaRoundNearest);
+    packed |= static_cast<uint32_t>(static_cast<uint8_t>(b)) << (8 * j);
+  }
+  *reinterpret_cast<uint32_t*>(qptr) = packed;
+}
+
 // ---- host wrappers ---------------------------------------------------------
 
 template <uint32_t N, uint32_t K_BYTES, uint32_t KCAP, uint32_t GRP_CAP, uint32_t N_TILE, uint32_t WARPS,
@@ -557,8 +881,9 @@ struct DecodeNvfp4GemvReduceKernel {
     const int32_t num_experts = static_cast<int32_t>(E.unwrap());
     RuntimeCheck(static_cast<int64_t>(num_experts) + 1 == E1.unwrap(), "m_indptr must be [E+1]");
     RuntimeCheck(num_experts > 0 && num_experts <= 1024, "num_experts out of range: ", num_experts);
-    LaunchKernel(dim3(N / THREADS), THREADS, device.unwrap())(
-        decode_nvfp4_gemv_reduce_kernel<N, KCAP, SLICES, THREADS>,
+    constexpr uint32_t TILE_M = 2, VEC = 4;
+    LaunchKernel(dim3(N / (THREADS * VEC), KCAP / TILE_M), THREADS, device.unwrap())(
+        decode_nvfp4_gemv_reduce_kernel<N, KCAP, SLICES, THREADS, TILE_M, VEC>,
         static_cast<const float*>(partials.data_ptr()),
         static_cast<const int32_t*>(m_indptr.data_ptr()),
         static_cast<const float*>(alphas.data_ptr()),
@@ -646,6 +971,81 @@ struct DecodeNvfp4MoeCombine {
         static_cast<const float*>(w.data_ptr()),
         static_cast<bf16_t*>(out.data_ptr()),
         topk_i);
+  }
+};
+
+template <uint32_t N1, uint32_t NR, uint32_t KCAP, uint32_t SLICES, uint32_t THREADS = 256>
+struct DecodeNvfp4MoeActQuant {
+  static void
+  run(const tvm::ffi::TensorView partials,
+      const tvm::ffi::TensorView m_indptr,
+      const tvm::ffi::TensorView alphas,
+      const tvm::ffi::TensorView global_scale,
+      double limit,
+      const tvm::ffi::TensorView a_q,
+      const tvm::ffi::TensorView a_sf) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    auto E = SymbolicSize{"num_experts"};
+    auto E1 = SymbolicSize{"num_experts_plus_one"};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({SLICES, KCAP, N1}).with_dtype<float>().with_device(device).verify(partials);
+    TensorMatcher({E1}).with_dtype<int32_t>().with_device(device).verify(m_indptr);
+    TensorMatcher({E}).with_dtype<float>().with_device(device).verify(alphas);
+    TensorMatcher({1}).with_dtype<float>().with_device(device).verify(global_scale);
+    TensorMatcher({KCAP, NR / 2}).with_dtype<uint8_t>().with_device(device).verify(a_q);
+    TensorMatcher({128, NR / 16}).with_dtype<uint8_t>().with_device(device).verify(a_sf);
+
+    const int32_t num_experts = static_cast<int32_t>(E.unwrap());
+    RuntimeCheck(static_cast<int64_t>(num_experts) + 1 == E1.unwrap(), "m_indptr must be [E+1]");
+    RuntimeCheck(num_experts > 0 && num_experts <= 1024, "num_experts out of range: ", num_experts);
+    constexpr uint32_t TILE_M = 2, VEC = 4;
+    LaunchKernel(dim3(NR / (THREADS * VEC), KCAP / TILE_M), THREADS, device.unwrap())(
+        decode_nvfp4_moe_actquant_kernel<N1, NR, KCAP, SLICES, THREADS, TILE_M, VEC>,
+        static_cast<const float*>(partials.data_ptr()),
+        static_cast<const int32_t*>(m_indptr.data_ptr()),
+        static_cast<const float*>(alphas.data_ptr()),
+        static_cast<const float*>(global_scale.data_ptr()),
+        static_cast<float>(limit),
+        static_cast<uint8_t*>(a_q.data_ptr()),
+        static_cast<uint8_t*>(a_sf.data_ptr()),
+        num_experts);
+  }
+};
+
+template <uint32_t K, uint32_t KCAP, uint32_t THREADS = 256>
+struct DecodeNvfp4MoeGatherQuant {
+  static void
+  run(const tvm::ffi::TensorView x,
+      const tvm::ffi::TensorView pad_v,
+      const tvm::ffi::TensorView tok_v,
+      int64_t r,
+      const tvm::ffi::TensorView global_scale,
+      const tvm::ffi::TensorView a_q,
+      const tvm::ffi::TensorView a_sf) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    auto T = SymbolicSize{"tokens"};
+    auto R = SymbolicSize{"rows"};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({T, K}).with_dtype<bf16_t>().with_device(device).verify(x);
+    TensorMatcher({R}).with_dtype<int64_t>().with_device(device).verify(pad_v);
+    TensorMatcher({R}).with_dtype<int64_t>().with_device(device).verify(tok_v);
+    TensorMatcher({1}).with_dtype<float>().with_device(device).verify(global_scale);
+    TensorMatcher({KCAP, K / 2}).with_dtype<uint8_t>().with_device(device).verify(a_q);
+    TensorMatcher({128, K / 16}).with_dtype<uint8_t>().with_device(device).verify(a_sf);
+
+    const int32_t rows = static_cast<int32_t>(r);
+    RuntimeCheck(rows >= 0 && static_cast<int64_t>(rows) == R.unwrap(), "r must equal pad_v len");
+    LaunchKernel(dim3(K / (THREADS * 8), KCAP), THREADS, device.unwrap())(
+        decode_nvfp4_moe_gatherquant_kernel<K, KCAP, THREADS>,
+        static_cast<const bf16_t*>(x.data_ptr()),
+        static_cast<const int64_t*>(pad_v.data_ptr()),
+        static_cast<const int64_t*>(tok_v.data_ptr()),
+        rows,
+        static_cast<const float*>(global_scale.data_ptr()),
+        static_cast<uint8_t*>(a_q.data_ptr()),
+        static_cast<uint8_t*>(a_sf.data_ptr()));
   }
 };
 
