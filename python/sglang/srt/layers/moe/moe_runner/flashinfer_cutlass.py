@@ -291,13 +291,20 @@ def _run_flashinfer_cutlass(
 
     # Decode split-K NVFP4 GEMV path (tiny-M MoE, deterministic). Off by
     # default; enable with SGLANG_DECODE_MOE_GEMV=1.
+    _gemv_limit = runner_config.gemm1_clamp_limit or runner_config.swiglu_limit
     if (
         quant_info.quant_type == "fp4"
         and os.environ.get("SGLANG_DECODE_MOE_GEMV", "0") == "1"
         and 0 < x.shape[0] <= 32
-        and x.shape[0] * topk_ids.shape[1] <= 128  # KCAP row cap
+        and x.shape[0] * topk_ids.shape[1] <= 32  # fused-chain envelope:
+        # KCAP=128 pool rows cover 32 active experts x pad-4; padded rows can
+        # exceed 128 for more slots, so 32 is the validated hard cap.
         and x_sf is None  # kernel quantizes bf16 activations itself
-        and quant_info.swiglu_alpha is None  # GPT-OSS alpha keeps the fallback
+        and runner_config.activation == "silu"
+        # GPT-OSS params: only the silu-neutral alpha/beta with a plain
+        # activation clamp are supported; everything else keeps the fallback
+        and (runner_config.gemm1_alpha is None or runner_config.gemm1_alpha == 1.0)
+        and (runner_config.gemm1_beta is None or runner_config.gemm1_beta == 0.0)
         and not runner_config.apply_router_weight_on_input
     ):
         from sglang.kernels.ops.moe.decode_nvfp4_gemv import decode_nvfp4_moe_forward
@@ -312,6 +319,7 @@ def _run_flashinfer_cutlass(
             quant_info.w13_weight,
             quant_info.w2_weight,
             output,
+            swiglu_limit=_gemv_limit,
         )
 
     w13_weight = quant_info.w13_weight

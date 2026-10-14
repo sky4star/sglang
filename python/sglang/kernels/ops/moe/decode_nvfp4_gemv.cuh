@@ -376,6 +376,127 @@ __global__ void decode_nvfp4_gemv_reduce_kernel(
   }
 }
 
+// ---- fused routing bookkeeping (chain track, 2026-10-13) --------------------
+//
+// Replaces ~15 eager torch ops (argsort/bincount/cumsum/cummax/gather/...).
+// torch.bincount does a hidden D2H sync to size its output: it breaks CUDA
+// graph capture outright and dominates eager CPU dispatch time (chain prof:
+// routing segment 162us, all CPU-bound). One 256-thread CTA, fully
+// deterministic:
+//   1) per-expert padded counts (pad-to-4), serial exclusive scan by thread 0
+//      (E <= 1024 -> negligible) writing mip[E+1]
+//   2) one-warp bitonic sort over UNIQUE keys key = expert*R + slot (uniqueness
+//      makes stability moot; output is a pure function of inputs)
+//   3) emit order/inv/token_of/pad_row/active_ids
+// Semantics are bit-identical to the torch formulation (same padded mip, same
+// stable-equivalent permutation, same pad-to-4 segments, -1 sentinels).
+//
+// R = T*topk must be <= R_CAP (32): production decode shapes; larger R falls
+// back to the torch path in python.
+template <uint32_t R_CAP, uint32_t MAXA, uint32_t THREADS>
+__global__ void decode_nvfp4_moe_routing_kernel(
+    const int32_t* __restrict__ flat,  // [R] expert id per slot
+    int32_t R, int32_t topk, int32_t E,
+    int32_t* __restrict__ order,        // [R] sorted-position -> slot
+    int32_t* __restrict__ inv,          // [R] slot -> sorted position
+    int64_t* __restrict__ token_of,     // [R] sorted-position -> token
+    int64_t* __restrict__ pad_row,      // [R] sorted-position -> padded row
+    int32_t* __restrict__ mip,          // [E+1] padded segment offsets
+    int32_t* __restrict__ active_ids) {  // [MAXA] compact active list
+  __shared__ int32_t s_pad[1025];   // padded per-expert counts (scan input)
+  __shared__ uint32_t s_key[R_CAP]; // sorted unique keys
+
+  const uint32_t tid = threadIdx.x;
+  // 1) padded counts
+  for (int32_t e = tid; e < E; e += THREADS) {
+    int32_t c = 0;
+    for (int32_t i = 0; i < R; ++i) {
+      c += (flat[i] == e);
+    }
+    s_pad[e] = (c + 3) & ~3;
+  }
+  __syncthreads();
+  // 2) exclusive scan (thread 0, E <= 1024) + one-warp bitonic sort
+  if (tid == 0) {
+    int32_t acc = 0;
+    for (int32_t e = 0; e < E; ++e) {
+      mip[e] = acc;
+      acc += s_pad[e];
+    }
+    mip[E] = acc;
+  }
+  if (tid < 32) {
+    uint32_t k = (tid < R) ? (static_cast<uint32_t>(flat[tid]) * R + tid) : 0xFFFFFFFFu;
+    // bitonic exchange: both partners must agree, so the comparison flips on
+    // the pair role (low vs high index within the s-distance pair), not just
+    // the segment direction. (A value-only test makes the high partner keep
+    // its value while the low one takes it -> duplicates, all-min collapse.)
+#pragma unroll
+    for (uint32_t w = 2; w <= 32; w <<= 1) {
+#pragma unroll
+      for (uint32_t s = w >> 1; s > 0; s >>= 1) {
+        const uint32_t ov = __shfl_xor_sync(0xFFFFFFFFu, k, s);
+        const bool up = (tid & w) == 0;   // pair sorts ascending
+        const bool low = (tid & s) == 0;  // this lane is the pair's low side
+        if (low == up ? (k > ov) : (k < ov)) {
+          k = ov;
+        }
+      }
+    }
+    s_key[tid] = k;
+  }
+  __syncthreads();
+  // 3) emit (warp 0). Group tests compare EXPERT = key/R, never the full key
+  // (keys are unique by construction: expert*R + slot).
+  if (tid < 32) {
+    const bool valid = tid < R;
+    const uint32_t key = s_key[tid];
+    const int32_t expert = valid ? static_cast<int32_t>(key / R) : -1;
+    const int32_t slot = valid ? static_cast<int32_t>(key % R) : -1;
+    uint32_t gs = tid;  // group start: experts of one expert are contiguous
+    while (gs > 0 && static_cast<uint32_t>(s_key[gs - 1] / R) == static_cast<uint32_t>(key / R)) {
+      --gs;
+    }
+    const bool new_group = valid && (tid == 0 || static_cast<uint32_t>(s_key[tid - 1] / R) !=
+                                                      static_cast<uint32_t>(key / R));
+    if (valid) {
+      order[tid] = slot;
+      inv[slot] = static_cast<int32_t>(tid);
+      token_of[tid] = slot / topk;
+      pad_row[tid] = static_cast<int64_t>(mip[expert]) + static_cast<int32_t>(tid - gs);
+    }
+    if (tid < MAXA) {
+      active_ids[tid] = new_group ? expert : -1;
+    }
+  }
+}
+
+// ---- fused routed combine (chain track) -------------------------------------
+//
+// Replaces ~8 eager ops (cast/gather/mul/scatter-arange/gather/view/sum/cast/
+// copy). out[t,k] = bf16( sum_j topk_weights[t,j] * f32(g2[pad_row[inv[r]],k]) )
+// with r = t*topk+j: j-ascending fp32 accumulation, no atomics -> deterministic
+// (matches the torch chain's unsort-then-slot-order-sum semantics).
+template <uint32_t K, uint32_t THREADS>
+__global__ void decode_nvfp4_moe_combine_kernel(
+    const bf16_t* __restrict__ g2,        // [KCAP, K]
+    const int32_t* __restrict__ inv,      // [R]
+    const int64_t* __restrict__ pad_row,  // [R]
+    const float* __restrict__ w,          // [R] per-slot routing weights
+    bf16_t* __restrict__ out,             // [T, K]
+    int32_t topk) {
+  const uint32_t k = blockIdx.x * THREADS + threadIdx.x;
+  const int32_t t = blockIdx.y;
+  const int32_t r0 = t * topk;
+  float acc = 0.0f;
+  for (int32_t j = 0; j < topk; ++j) {
+    const int32_t r = r0 + j;
+    const int64_t row = pad_row[inv[r]];
+    acc += static_cast<float>(g2[static_cast<size_t>(row) * K + k]) * w[r];
+  }
+  out[static_cast<size_t>(t) * K + k] = cast<bf16_t>(acc);
+}
+
 // ---- host wrappers ---------------------------------------------------------
 
 template <uint32_t N, uint32_t K_BYTES, uint32_t KCAP, uint32_t GRP_CAP, uint32_t N_TILE, uint32_t WARPS,
@@ -443,6 +564,88 @@ struct DecodeNvfp4GemvReduceKernel {
         static_cast<const float*>(alphas.data_ptr()),
         static_cast<bf16_t*>(out.data_ptr()),
         num_experts);
+  }
+};
+
+template <uint32_t R_CAP, uint32_t MAXA, uint32_t THREADS = 256>
+struct DecodeNvfp4MoeRouting {
+  static void
+  run(const tvm::ffi::TensorView flat,
+      int64_t r, int64_t topk, int64_t num_experts,
+      const tvm::ffi::TensorView order,
+      const tvm::ffi::TensorView inv,
+      const tvm::ffi::TensorView token_of,
+      const tvm::ffi::TensorView pad_row,
+      const tvm::ffi::TensorView mip,
+      const tvm::ffi::TensorView active_ids) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    auto R = SymbolicSize{"rows"};
+    auto E = SymbolicSize{"num_experts"};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({R}).with_dtype<int32_t>().with_device(device).verify(flat);
+    TensorMatcher({R}).with_dtype<int32_t>().with_device(device).verify(order);
+    TensorMatcher({R}).with_dtype<int32_t>().with_device(device).verify(inv);
+    TensorMatcher({R}).with_dtype<int64_t>().with_device(device).verify(token_of);
+    TensorMatcher({R}).with_dtype<int64_t>().with_device(device).verify(pad_row);
+    TensorMatcher({E}).with_dtype<int32_t>().with_device(device).verify(mip);
+    TensorMatcher({MAXA}).with_dtype<int32_t>().with_device(device).verify(active_ids);
+
+    const int32_t rows = static_cast<int32_t>(r);
+    const int32_t topk_i = static_cast<int32_t>(topk);
+    const int32_t E_i = static_cast<int32_t>(num_experts);
+    RuntimeCheck(rows > 0 && rows <= static_cast<int64_t>(R_CAP), "rows out of range: ", rows);
+    RuntimeCheck(topk_i > 0 && rows % topk_i == 0, "topk must divide rows");
+    RuntimeCheck(static_cast<int64_t>(E_i) + 1 == E.unwrap(), "mip must be [E+1]");
+    RuntimeCheck(E_i > 0 && E_i <= 1024, "num_experts out of range: ", E_i);
+    LaunchKernel(dim3(1), THREADS, device.unwrap())(
+        decode_nvfp4_moe_routing_kernel<R_CAP, MAXA, THREADS>,
+        static_cast<const int32_t*>(flat.data_ptr()),
+        rows, topk_i, E_i,
+        static_cast<int32_t*>(order.data_ptr()),
+        static_cast<int32_t*>(inv.data_ptr()),
+        static_cast<int64_t*>(token_of.data_ptr()),
+        static_cast<int64_t*>(pad_row.data_ptr()),
+        static_cast<int32_t*>(mip.data_ptr()),
+        static_cast<int32_t*>(active_ids.data_ptr()));
+  }
+};
+
+template <uint32_t K, uint32_t THREADS = 512>
+struct DecodeNvfp4MoeCombine {
+  static void
+  run(const tvm::ffi::TensorView g2,
+      const tvm::ffi::TensorView inv,
+      const tvm::ffi::TensorView pad_row,
+      const tvm::ffi::TensorView w,
+      const tvm::ffi::TensorView out,
+      int64_t topk) {
+    using namespace host;
+    auto device = SymbolicDevice{};
+    auto R = SymbolicSize{"rows"};
+    auto KC = SymbolicSize{"kcap"};
+    auto T = SymbolicSize{"tokens"};
+    device.set_options<kDLCUDA>();
+    TensorMatcher({KC, K}).with_dtype<bf16_t>().with_device(device).verify(g2);
+    TensorMatcher({R}).with_dtype<int32_t>().with_device(device).verify(inv);
+    TensorMatcher({R}).with_dtype<int64_t>().with_device(device).verify(pad_row);
+    TensorMatcher({R}).with_dtype<float>().with_device(device).verify(w);
+    TensorMatcher({T, K}).with_dtype<bf16_t>().with_device(device).verify(out);
+
+    const int32_t rows = static_cast<int32_t>(R.unwrap());
+    const int32_t topk_i = static_cast<int32_t>(topk);
+    const int32_t tokens = static_cast<int32_t>(T.unwrap());
+    RuntimeCheck(topk_i > 0 && rows % topk_i == 0, "topk must divide rows");
+    RuntimeCheck(rows / topk_i == tokens, "out rows mismatch");
+    RuntimeCheck(K % THREADS == 0, "K must be a multiple of THREADS");
+    LaunchKernel(dim3(K / THREADS, tokens), THREADS, device.unwrap())(
+        decode_nvfp4_moe_combine_kernel<K, THREADS>,
+        static_cast<const bf16_t*>(g2.data_ptr()),
+        static_cast<const int32_t*>(inv.data_ptr()),
+        static_cast<const int64_t*>(pad_row.data_ptr()),
+        static_cast<const float*>(w.data_ptr()),
+        static_cast<bf16_t*>(out.data_ptr()),
+        topk_i);
   }
 };
 
